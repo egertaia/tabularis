@@ -109,6 +109,10 @@ pub fn load_config(context: &RuntimeContext) -> AppConfig {
     persistence::load_config(context)
 }
 
+pub fn save_config(context: &RuntimeContext, update: AppConfig) -> Result<AppConfig, String> {
+    persistence::save_config(context, update)
+}
+
 pub fn theme_catalog(context: &RuntimeContext) -> crate::theme_packages::ThemeCatalog {
     themes::catalog(context)
 }

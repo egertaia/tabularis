@@ -81,17 +81,27 @@ pub struct ResultGrid {
 
 impl ResultGrid {
     pub fn new(colors: &Colors) -> Self {
-        Self {
+        let mut grid = Self {
             columns: Vec::new(),
             rows: Vec::new(),
             edits: Edits::default(),
             editor: None,
-            text: hsla(&colors.text.primary),
-            muted: hsla(&colors.text.muted),
-            modified: hsla(&colors.semantic.modified),
-            new: hsla(&colors.semantic.new),
-            deleted: hsla(&colors.semantic.deleted),
-        }
+            text: Hsla::default(),
+            muted: Hsla::default(),
+            modified: Hsla::default(),
+            new: Hsla::default(),
+            deleted: Hsla::default(),
+        };
+        grid.recolor(colors);
+        grid
+    }
+
+    pub fn recolor(&mut self, colors: &Colors) {
+        self.text = hsla(&colors.text.primary);
+        self.muted = hsla(&colors.text.muted);
+        self.modified = hsla(&colors.semantic.modified);
+        self.new = hsla(&colors.semantic.new);
+        self.deleted = hsla(&colors.semantic.deleted);
     }
 
     pub fn set(&mut self, columns: Vec<String>, rows: Vec<Vec<Value>>) {

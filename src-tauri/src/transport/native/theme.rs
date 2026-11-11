@@ -1,11 +1,11 @@
 use super::backend;
 use crate::runtime::RuntimeContext;
-use gpui::{Hsla, Rgba};
+use gpui::{px, App, Hsla, Rgba};
 use gpui_component::highlighter::HighlightTheme;
-use gpui_component::theme::ThemeColor;
+use gpui_component::theme::{Theme, ThemeColor};
 use serde::Deserialize;
 
-const FALLBACK_ID: &str = "tabularis-dark";
+pub const FALLBACK_ID: &str = "tabularis-dark";
 const BUILTIN: &str = include_str!("../../../../packages/web-ui/src/themes/builtin-themes.json");
 
 // Not `theme_models::Colors`: its semantic keys do not match the legacy theme JSON.
@@ -113,6 +113,17 @@ pub fn apply(c: &Colors, t: &mut ThemeColor) {
     t.table_head_foreground = hsla(&c.text.muted);
     t.table_row_border = hsla(&c.border.subtle);
     t.table_hover = hsla(&c.bg.elevated);
+}
+
+pub fn install(colors: &Colors, cx: &mut App) {
+    Theme::update(cx, |t| {
+        apply(colors, &mut t.colors);
+        t.highlight_theme = highlight_theme(colors);
+    });
+}
+
+pub fn set_editor_font_size(size: u32, cx: &mut App) {
+    Theme::update(cx, |t| t.mono_font_size = px(size as f32));
 }
 
 pub fn highlight_theme(c: &Colors) -> std::sync::Arc<HighlightTheme> {

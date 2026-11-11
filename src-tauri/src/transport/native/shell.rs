@@ -4,9 +4,9 @@ use super::connection_form::{ConnectionForm, FormEvent};
 use super::edits::{self, Source};
 use super::grid::ResultGrid;
 use super::i18n::t;
+use super::settings::{self, SettingsEvent, SettingsView};
 use super::tabs::Tabs;
-use super::theme::hsla;
-use super::theme::Colors;
+use super::theme::{self, hsla, Colors};
 use super::tree::{Child, Load, Node, RowKind, Tree};
 use crate::application::explorer::{Entry, EntryKind, Location};
 use crate::application::queries::QueryRequestScope;
@@ -151,6 +151,9 @@ pub struct Shell {
     cancellation: Arc<QueryCancellationState>,
     connections: Result<Vec<SavedConnection>, String>,
     form: Option<Entity<ConnectionForm>>,
+    settings: Option<Entity<SettingsView>>,
+    // Rows a run keeps before it stops; 0 keeps all.
+    page_size: u32,
     selected: Option<String>,
     tree: Tree,
     // Bumped on every selection so late metadata replies are ignored.
@@ -160,6 +163,7 @@ pub struct Shell {
 }
 
 impl Shell {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -168,6 +172,7 @@ impl Shell {
         runtime: tokio::runtime::Handle,
         state: Arc<ApplicationState>,
         connections: Result<Vec<SavedConnection>, String>,
+        page_size: u32,
     ) -> Self {
         Self {
             tabs: Tabs::new(new_view(&colors, None, false, window, cx)),
@@ -178,6 +183,8 @@ impl Shell {
             state,
             connections,
             form: None,
+            settings: None,
+            page_size,
             selected: None,
             tree: Tree::default(),
             tree_id: 0,
@@ -186,6 +193,7 @@ impl Shell {
     }
 
     pub fn start_bench(&mut self, bench: Bench, window: &mut Window, cx: &mut Context<Self>) {
+        self.page_size = 0;
         self.pick(bench.connection.clone(), cx);
         let id = self.tabs.active_id();
         let view = &mut self.tabs.active_mut().view;
@@ -249,6 +257,7 @@ impl Shell {
                         colors, context, state, runtime, drivers, index, saved, window, cx,
                     )
                 });
+                this.settings = None;
                 cx.subscribe_in(&form, window, |this, _, event: &FormEvent, window, cx| {
                     this.form = None;
                     if let FormEvent::Saved { plain_text } = event {
@@ -267,6 +276,42 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (colors, context, runtime) = (
+            self.colors.clone(),
+            self.context.clone(),
+            self.runtime.clone(),
+        );
+        let view = cx.new(|cx| SettingsView::new(colors, context, runtime, window, cx));
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &SettingsEvent, window, cx| {
+                match event {
+                    SettingsEvent::Theme(colors) => {
+                        theme::install(colors, cx);
+                        for tab in this.tabs.items_mut() {
+                            tab.view.table.update(cx, |table, cx| {
+                                table.delegate_mut().recolor(colors);
+                                cx.notify();
+                            });
+                        }
+                        this.colors = (**colors).clone();
+                    }
+                    SettingsEvent::PageSize(size) => this.page_size = *size,
+                    SettingsEvent::FontSize(size) => theme::set_editor_font_size(*size, cx),
+                    SettingsEvent::Closed => this.settings = None,
+                }
+                window.refresh();
+                cx.notify();
+            },
+        )
+        .detach();
+        self.form = None;
+        self.settings = Some(view);
+        cx.notify();
     }
 
     fn reload_connections(&mut self) {
@@ -574,9 +619,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(view) = self.tabs.get_mut(id).map(|tab| &mut tab.view) else {
+        let Some(tab) = self.tabs.get_mut(id) else {
             return;
         };
+        let view = &mut tab.view;
         if matches!(chunk, QueryChunk::Columns(_)) {
             view.sets += 1;
         }
@@ -585,19 +631,35 @@ impl Shell {
         }
         match chunk {
             QueryChunk::Columns(columns) => self.show_columns(id, columns, cx),
-            QueryChunk::Rows(rows) => {
+            QueryChunk::Rows(mut rows) => {
                 if view.rows == 0 {
                     if let Some(bench) = &view.bench {
                         bench::first_batch(bench, window);
                     }
                 }
-                view.rows += rows.len();
+                let (keep, truncated) =
+                    settings::within_page_size(self.page_size, view.rows, rows.len());
+                rows.truncate(keep);
+                view.rows += keep;
                 view.status =
                     t("editor.rowsRetrieved").replace("{{count}}", &view.rows.to_string());
+                if truncated {
+                    let hint = t("editor.batchSnapshotTruncated");
+                    view.status.push_str(&format!(
+                        " \u{b7} {}",
+                        hint.replace("{{count}}", &view.rows.to_string())
+                    ));
+                }
                 view.table.update(cx, |table, cx| {
                     table.delegate_mut().append(rows);
                     cx.notify();
                 });
+                if truncated {
+                    if let Some(connection) = view.connection.clone() {
+                        self.connected.insert(connection);
+                    }
+                    tab.stream.stop();
+                }
             }
         }
         cx.notify();
@@ -1043,7 +1105,16 @@ impl Render for Shell {
                             })),
                     ),
             )
-            .child(list);
+            .child(list)
+            .child(
+                Button::new("settings")
+                    .ghost()
+                    .xsmall()
+                    .label(t("sidebar.settings"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_settings(window, cx)
+                    })),
+            );
         let active = self.tabs.active();
         let active_id = active.id;
         let view = &active.view;
@@ -1146,9 +1217,10 @@ impl Render for Shell {
                 this.close_tab(this.tabs.active_id(), window, cx)
             }))
             .child(sidebar)
-            .child(match &self.form {
-                Some(form) => div().flex_1().h_full().child(form.clone()),
-                None => div()
+            .child(match (&self.settings, &self.form) {
+                (Some(settings), _) => div().flex_1().h_full().child(settings.clone()),
+                (None, Some(form)) => div().flex_1().h_full().child(form.clone()),
+                (None, None) => div()
                     .flex()
                     .flex_col()
                     .flex_1()

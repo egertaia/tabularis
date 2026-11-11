@@ -321,3 +321,43 @@ async fn deleting_a_connection_removes_it_from_the_list() {
 
     assert!(listed(&context).is_empty());
 }
+
+#[test]
+fn changing_the_page_size_in_native_settings_saves_it_to_the_config_without_changing_other_config_fields(
+) {
+    use super::settings::{font_size_update, page_size_update, theme_update};
+    let (_temp, context, _, _) = connection_fixture();
+    super::backend::save_config(&context, theme_update("tabularis-light")).unwrap();
+    super::backend::save_config(&context, font_size_update(18)).unwrap();
+    let before = serde_json::to_value(super::backend::load_config(&context)).unwrap();
+
+    super::backend::save_config(&context, page_size_update(500)).unwrap();
+
+    let mut expected = before;
+    expected["resultPageSize"] = 500.into();
+    let after = serde_json::to_value(super::backend::load_config(&context)).unwrap();
+    assert_eq!(after, expected);
+    assert_eq!(after["theme"], "tabularis-light");
+    assert_eq!(after["editorFontSize"], 18);
+}
+
+#[test]
+fn a_page_size_of_500_stops_the_stream_after_500_rows_and_marks_it_truncated_while_0_loads_all_rows(
+) {
+    use super::settings::within_page_size;
+    let load = |limit: u32| {
+        let (mut shown, mut truncated) = (0, false);
+        for batch in [500, 10_000, 10_000, 3] {
+            let (keep, cut) = within_page_size(limit, shown, batch);
+            shown += keep;
+            if cut {
+                truncated = true;
+                break;
+            }
+        }
+        (shown, truncated)
+    };
+    assert_eq!(load(500), (500, true));
+    assert_eq!(load(0), (20_503, false));
+    assert_eq!(within_page_size(500, 0, 500), (500, false));
+}

@@ -61,6 +61,10 @@ impl<T> Tabs<T> {
         &self.items
     }
 
+    pub fn items_mut(&mut self) -> &mut [Tab<T>] {
+        &mut self.items
+    }
+
     pub fn active_id(&self) -> u64 {
         self.active
     }
