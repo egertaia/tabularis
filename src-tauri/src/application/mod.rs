@@ -5,6 +5,7 @@ pub mod connections;
 pub mod data_files;
 pub mod database_objects;
 pub mod database_transfers;
+pub mod explorer;
 pub mod file_transfers;
 pub mod generic_exports;
 pub mod host_settings;
