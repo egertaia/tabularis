@@ -1,5 +1,5 @@
 use super::bench::percentile;
-use super::grid::format_cell;
+use super::grid::{Cell, format_cell};
 use super::i18n::t;
 use super::shell::sql_to_run;
 use super::theme::colors_from_source;
@@ -21,12 +21,21 @@ fn reads_colors_from_legacy_theme_source() {
 }
 
 #[test]
-fn formats_cells_as_text() {
-    use serde_json::json;
-    assert_eq!(format_cell(&json!(null)), "NULL");
-    assert_eq!(format_cell(&json!("a\"b")), "a\"b");
-    assert_eq!(format_cell(&json!(1.5)), "1.5");
-    assert_eq!(format_cell(&json!({"k": [1, true]})), r#"{"k":[1,true]}"#);
+fn a_json_value_converted_to_a_cell_displays_the_same_text_as_before() {
+    use serde_json::{Value, json};
+    let big: Value = serde_json::from_str("18446744073709551615").unwrap();
+    for (value, text) in [
+        (json!(null), "NULL"),
+        (json!(42), "42"),
+        (json!(1.5), "1.5"),
+        (json!(2.0), "2.0"),
+        (big, "18446744073709551615"),
+        (json!(true), "true"),
+        (json!("a\"b"), "a\"b"),
+        (json!({"k": [1, true]}), r#"{"k":[1,true]}"#),
+    ] {
+        assert_eq!(format_cell(&Cell::from(value)), text);
+    }
 }
 
 #[test]
