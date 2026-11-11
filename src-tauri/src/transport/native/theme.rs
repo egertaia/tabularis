@@ -1,4 +1,4 @@
-use crate::application::{persistence, themes};
+use super::backend;
 use crate::runtime::RuntimeContext;
 use gpui::{Hsla, Rgba};
 use gpui_component::highlighter::HighlightTheme;
@@ -69,10 +69,10 @@ pub fn colors_from_source(source: &str) -> Option<Colors> {
 
 /// Active theme from the catalog; unknown ids and non-legacy theme formats use the built-in dark theme.
 pub fn load(context: &RuntimeContext) -> Colors {
-    let id = persistence::load_config(context)
+    let id = backend::load_config(context)
         .theme
         .unwrap_or_else(|| FALLBACK_ID.into());
-    themes::catalog(context)
+    backend::theme_catalog(context)
         .themes
         .iter()
         .find(|theme| theme.id == id && theme.available)

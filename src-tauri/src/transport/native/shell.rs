@@ -1,3 +1,4 @@
+use super::backend;
 use super::bench::{self, Bench};
 use super::edits::{self, Source};
 use super::grid::ResultGrid;
@@ -6,8 +7,8 @@ use super::tabs::Tabs;
 use super::theme::hsla;
 use super::theme::Colors;
 use super::tree::{Child, Load, Node, RowKind, Tree};
-use crate::application::explorer::{self, Entry, EntryKind, Location};
-use crate::application::queries::{self, QueryRequestScope};
+use crate::application::explorer::{Entry, EntryKind, Location};
+use crate::application::queries::QueryRequestScope;
 use crate::commands::QueryCancellationState;
 use crate::drivers::driver_trait::QueryChunk;
 use crate::models::SavedConnection;
@@ -66,12 +67,12 @@ enum Job {
 
 async fn fetch(context: RuntimeContext, id: String, job: Job) -> Result<Vec<Child>, String> {
     match job {
-        Job::List(location) => Ok(explorer::list(&context, &id, &location)
+        Job::List(location) => Ok(backend::list(&context, &id, &location)
             .await?
             .into_iter()
             .map(|entry| Child::Node(Node::new(&location, entry)))
             .collect()),
-        Job::Columns(location, entry) => Ok(explorer::columns(&context, &id, &location, &entry)
+        Job::Columns(location, entry) => Ok(backend::columns(&context, &id, &location, &entry)
             .await?
             .into_iter()
             .map(|column| Child::Column {
@@ -317,9 +318,9 @@ impl Shell {
             let connection_id = connection_id.clone();
             self.runtime.spawn(async move {
                 let sql =
-                    explorer::open_table_query(&context, &connection_id, &location, &name).await?;
+                    backend::open_table_query(&context, &connection_id, &location, &name).await?;
                 let columns = if kind == EntryKind::Table {
-                    explorer::editable_columns(&context, &connection_id, &location, &name)
+                    backend::editable_columns(&context, &connection_id, &location, &name)
                         .await
                         .ok()
                         .flatten()
@@ -521,7 +522,7 @@ impl Shell {
         let scope = view.scope.clone();
         let (sender, mut chunks) = tokio::sync::mpsc::unbounded_channel();
         let task = self.runtime.spawn(async move {
-            queries::stream_query(
+            backend::stream_query(
                 &context,
                 &cancellation,
                 QueryRequestScope::DESKTOP,

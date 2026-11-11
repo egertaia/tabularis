@@ -1,3 +1,4 @@
+mod backend;
 mod bench;
 mod edits;
 mod grid;
@@ -9,7 +10,6 @@ mod tests;
 mod theme;
 mod tree;
 
-use crate::application::connections;
 use crate::commands::QueryCancellationState;
 use crate::runtime::RuntimeContext;
 use gpui::{App, AppContext as _, WindowOptions};
@@ -19,7 +19,7 @@ use gpui_component::{Root, Theme};
 pub fn run(context: RuntimeContext, runtime: tokio::runtime::Handle) {
     let cancellation = std::sync::Arc::new(QueryCancellationState::default());
     let colors = theme::load(&context);
-    let connections = connections::load_redacted_connections(&context.paths.connections_file());
+    let connections = backend::load_redacted_connections(&context.paths.connections_file());
     gpui_platform::application().run(move |cx: &mut App| {
         gpui_component::init(cx);
         Theme::update(cx, |t| {
