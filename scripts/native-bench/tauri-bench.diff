@@ -1,0 +1,212 @@
+diff --git a/packages/web-ui/src/App.tsx b/packages/web-ui/src/App.tsx
+index f4a7b181..a7e9aa3f 100644
+--- a/packages/web-ui/src/App.tsx
++++ b/packages/web-ui/src/App.tsx
+@@ -29,6 +29,7 @@ import {APP_VERSION} from './version';
+ import {isVersionAtMost, isVersionNewer} from './utils/versionCompare';
+ import {useTabularisClient} from './hooks/useTabularisClient';
+ import {BROWSER_ROUTES, WEB_UI_BASE_PATH} from './routing';
++import {BenchDriver} from './benchDriver';
+ 
+ // The editor route owns the Editor import, so lazy-loading it keeps Editor in its own chunk.
+ const ConnectionEditorRoute = lazy(() =>
+@@ -153,6 +154,7 @@ export function App() {
+             <AlertProvider>
+                 <BrowserPlatformDialogs />
+                 <BrowserRouter basename={WEB_UI_BASE_PATH}>
++                    <BenchDriver />
+                     <ConnectionHealthMonitor />
+                     <PluginRuntimeWarningToasts />
+                     <KeybindingsProvider>
+diff --git a/packages/web-ui/src/benchDriver.tsx b/packages/web-ui/src/benchDriver.tsx
+new file mode 100644
+index 00000000..757aee2c
+--- /dev/null
++++ b/packages/web-ui/src/benchDriver.tsx
+@@ -0,0 +1,97 @@
++import {useEffect, useRef} from 'react';
++import {useNavigate} from 'react-router-dom';
++import {invoke} from '@tauri-apps/api/core';
++import {useDatabase} from '@/hooks/useDatabase';
++
++type BenchResult = {
++    rows: unknown[];
++    truncated?: boolean;
++    pagination?: {has_more?: boolean} | null;
++};
++
++const MAX_SCROLL_FRAMES = 600;
++const SCROLL_STEP_PX = 2000;
++
++let armed = false;
++let t0: number | null = null;
++
++const emit = (line: string) => invoke('bench_emit', {line});
++const frame = () => new Promise<number>((resolve) => requestAnimationFrame(resolve));
++
++function percentile(sorted: number[], p: number): number {
++    return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
++}
++
++async function fail(error: unknown) {
++    await emit(`BENCH error=${String(error instanceof Error ? error.message : error)}`);
++    await invoke('bench_exit', {code: 1});
++}
++
++export function benchStart() {
++    if (armed && t0 === null) t0 = performance.now();
++}
++
++export function benchResult(res: BenchResult) {
++    if (!armed || t0 === null) return;
++    const start = t0;
++    const loadedAt = performance.now();
++    armed = false;
++    measure(start, loadedAt, res).catch(fail);
++}
++
++async function measure(
++    start: number,
++    loadedAt: number,
++    res: BenchResult,
++) {
++    let grid: HTMLElement | null = null;
++    while (!(grid = document.querySelector<HTMLElement>('[data-bench-grid]'))?.querySelector('td[data-row-index]')) {
++        await frame();
++    }
++    await frame();
++    await frame();
++    const paintedAt = performance.now();
++    await emit(`BENCH first_paint_ms=${(paintedAt - start).toFixed(1)}`);
++    await emit(
++        `BENCH all_loaded_ms=${res.truncated || res.pagination?.has_more ? 'na' : (loadedAt - start).toFixed(1)}`,
++    );
++    await emit(`BENCH rows=${res.rows.length}`);
++
++    const intervals: number[] = [];
++    let last = await frame();
++    for (let i = 0; i < MAX_SCROLL_FRAMES; i++) {
++        if (grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 1) break;
++        grid.scrollTop += SCROLL_STEP_PX;
++        const now = await frame();
++        intervals.push(now - last);
++        last = now;
++    }
++    const sorted = [...intervals].sort((a, b) => a - b);
++    await emit(
++        `BENCH scroll_p50_ms=${percentile(sorted, 50).toFixed(2)} scroll_p99_ms=${percentile(sorted, 99).toFixed(2)} frames=${sorted.length}`,
++    );
++    await invoke('bench_exit', {code: 0});
++}
++
++export function BenchDriver() {
++    const {connect} = useDatabase();
++    const navigate = useNavigate();
++    const started = useRef(false);
++
++    useEffect(() => {
++        if (started.current) return;
++        started.current = true;
++        (async () => {
++            const config = await invoke<[string, string] | null>('bench_config');
++            if (!config) return;
++            const [sql, connectionId] = config;
++            armed = true;
++            await connect(connectionId);
++            navigate('/editor', {
++                state: {kind: 'console', initialQuery: sql, targetConnectionId: connectionId},
++            });
++        })().catch(fail);
++    }, [connect, navigate]);
++
++    return null;
++}
+diff --git a/packages/web-ui/src/components/ui/DataGrid.tsx b/packages/web-ui/src/components/ui/DataGrid.tsx
+index e7b223a4..bddc2965 100644
+--- a/packages/web-ui/src/components/ui/DataGrid.tsx
++++ b/packages/web-ui/src/components/ui/DataGrid.tsx
+@@ -3963,6 +3963,7 @@ export const DataGrid = React.memo(function DataGrid({
+             {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- focus host for the spreadsheet keyboard model (arrows, ranges, copy); a full ARIA grid needs per-cell roles and activedescendant */}
+             <div
+                 ref={parentRef}
++                data-bench-grid
+                 // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- same focus host: must be reachable with Tab to use the keyboard model
+                 tabIndex={0}
+                 onKeyDown={handleGridKeyDown}
+diff --git a/packages/web-ui/src/pages/Editor.tsx b/packages/web-ui/src/pages/Editor.tsx
+index 4f9a17ce..3274505b 100644
+--- a/packages/web-ui/src/pages/Editor.tsx
++++ b/packages/web-ui/src/pages/Editor.tsx
+@@ -231,6 +231,7 @@ import type {
+     EditorNavigationIntent,
+     EditorNavigationRequest,
+ } from '@/types/editor';
++import {benchResult, benchStart} from '@/benchDriver';
+ import {createEditorNavigationIntent, parseEditorNavigationIntent} from '@/utils/editorNavigation';
+ import {CommandPaletteScopeBridge} from '@/components/layout/CommandPaletteScopeBridge';
+ import type {CommandScope} from '@/types/commands';
+@@ -1538,6 +1539,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
+                 );
+ 
+                 const start = performance.now();
++                benchStart();
+                 const queryRequestId = createRequestId();
+                 activeQueryRequestIdsRef.current.add(queryRequestId);
+ 
+@@ -1566,6 +1568,7 @@ export const Editor = ({commandScopeId}: EditorProps) => {
+                         {requestId: queryRequestId, cancellationId: queryRequestId},
+                     );
+                     const end = performance.now();
++                    benchResult(res);
+                     const latestTab = tabsRef.current.find((tab) => tab.id === targetTabId);
+                     if (backgroundRefresh && (!latestTab || !canApplyRefresh(latestTab)))
+                         return false;
+diff --git a/src-tauri/src/transport/desktop/bench.rs b/src-tauri/src/transport/desktop/bench.rs
+new file mode 100644
+index 00000000..5ba09ebe
+--- /dev/null
++++ b/src-tauri/src/transport/desktop/bench.rs
+@@ -0,0 +1,21 @@
++use std::io::Write;
++
++#[tauri::command]
++pub fn bench_config() -> Option<(String, String)> {
++    let sql_path = std::env::var("TABULARIS_BENCH_SQL").ok()?;
++    let connection = std::env::var("TABULARIS_BENCH_CONNECTION").ok()?;
++    let sql = std::fs::read_to_string(sql_path).ok()?;
++    Some((sql, connection))
++}
++
++#[tauri::command]
++pub fn bench_emit(line: String) {
++    let mut out = std::io::stdout();
++    let _ = writeln!(out, "{line}");
++    let _ = out.flush();
++}
++
++#[tauri::command]
++pub fn bench_exit(code: i32) {
++    std::process::exit(code);
++}
+diff --git a/src-tauri/src/transport/desktop/mod.rs b/src-tauri/src/transport/desktop/mod.rs
+index 20d5d5a2..72237c0f 100644
+--- a/src-tauri/src/transport/desktop/mod.rs
++++ b/src-tauri/src/transport/desktop/mod.rs
+@@ -6,6 +6,7 @@ pub mod ai_approval_watcher;
+ pub mod ai_commands;
+ pub mod askpass;
+ pub mod backup;
++pub mod bench;
+ pub mod chatgpt;
+ pub mod clipboard_import;
+ pub mod commands;
+@@ -356,6 +357,9 @@ pub fn run(args: crate::cli::Args, log_buffer: crate::logger::SharedLogBuffer) {
+         .invoke_handler(tauri::generate_handler![
+             system_theme::get_linux_system_theme,
+             is_debug_mode,
++            bench::bench_config,
++            bench::bench_emit,
++            bench::bench_exit,
+             open_devtools,
+             close_devtools,
+             commands::get_registered_drivers,
