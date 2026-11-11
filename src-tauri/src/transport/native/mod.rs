@@ -5,6 +5,7 @@ mod shell;
 #[cfg(test)]
 mod tests;
 mod theme;
+mod tree;
 
 use crate::application::connections;
 use crate::commands::QueryCancellationState;
