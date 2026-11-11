@@ -4,6 +4,7 @@ mod shell;
 mod tests;
 mod theme;
 
+use crate::application::connections;
 use crate::runtime::RuntimeContext;
 use gpui::{App, AppContext as _, WindowOptions};
 use gpui_component::{Root, Theme};
@@ -12,6 +13,7 @@ use gpui_component::{Root, Theme};
 /// for later milestones, which run database work on the tokio runtime.
 pub fn run(context: RuntimeContext, _runtime: tokio::runtime::Handle) {
     let colors = theme::load(&context);
+    let connections = connections::load_redacted_connections(&context.paths.connections_file());
     gpui_platform::application().run(move |cx: &mut App| {
         gpui_component::init(cx);
         Theme::update(cx, |t| theme::apply(&colors, &mut t.colors));
@@ -29,7 +31,7 @@ pub fn run(context: RuntimeContext, _runtime: tokio::runtime::Handle) {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
-            let view = cx.new(|_| shell::Shell::new(colors));
+            let view = cx.new(|_| shell::Shell::new(colors, connections));
             cx.new(|cx| Root::new(view, window, cx))
         })
         .expect("Failed to open window");
