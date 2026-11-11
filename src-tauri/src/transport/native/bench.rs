@@ -1,7 +1,9 @@
 use super::grid::ResultGrid;
 use gpui::{App, Entity, Window, px};
 use gpui_component::table::TableState;
+use std::cell::Cell;
 use std::io::Write as _;
+use std::rc::Rc;
 use std::time::Instant;
 
 const SCROLL_STEP_PX: f32 = 2000.;
@@ -11,6 +13,7 @@ pub struct Bench {
     pub sql: String,
     pub connection: String,
     pub start: Instant,
+    pub first_paint_ms: Rc<Cell<Option<f64>>>,
 }
 
 impl Bench {
@@ -22,6 +25,7 @@ impl Bench {
                 sql,
                 connection,
                 start: Instant::now(),
+                first_paint_ms: Rc::default(),
             }),
             Err(error) => fail(&format!("{path}: {error}")),
         }
@@ -53,6 +57,17 @@ fn ms(from: Instant, to: Instant) -> f64 {
     to.duration_since(from).as_secs_f64() * 1000.
 }
 
+/// Records the first frame drawn after the first row batch is shown.
+pub fn first_batch(bench: &Bench, window: &mut Window) {
+    let (start, first_paint_ms) = (bench.start, bench.first_paint_ms.clone());
+    window.on_next_frame(move |_, _| {
+        if first_paint_ms.get().is_none() {
+            first_paint_ms.set(Some(ms(start, Instant::now())));
+        }
+    });
+}
+
+/// Starts scrolling once every row is loaded.
 pub fn loaded(
     bench: Bench,
     rows: usize,
@@ -66,7 +81,10 @@ pub fn loaded(
             table,
             rows,
             all_loaded_ms,
-            first_paint_ms: ms(bench.start, now),
+            first_paint_ms: bench
+                .first_paint_ms
+                .get()
+                .unwrap_or_else(|| ms(bench.start, now)),
             last_frame: now,
             intervals: Vec::new(),
         };

@@ -31,6 +31,10 @@ impl ResultGrid {
         self.columns = columns;
         self.rows = rows;
     }
+
+    pub fn append(&mut self, rows: Vec<Vec<Value>>) {
+        self.rows.extend(rows);
+    }
 }
 
 impl TableDelegate for ResultGrid {

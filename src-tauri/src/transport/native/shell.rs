@@ -3,8 +3,9 @@ use super::grid::ResultGrid;
 use super::i18n::t;
 use super::theme::Colors;
 use super::theme::hsla;
-use crate::application::queries::{self, QueryRequestScope, QueryResponsePolicy};
+use crate::application::queries::{self, QueryRequestScope};
 use crate::commands::QueryCancellationState;
+use crate::drivers::driver_trait::QueryChunk;
 use crate::models::SavedConnection;
 use crate::runtime::RuntimeContext;
 use gpui::{
@@ -52,9 +53,10 @@ pub struct Shell {
     table: Entity<TableState<ResultGrid>>,
     status: String,
     error: Option<String>,
-    running: bool,
-    // Bumped when the selection changes so a late result is dropped.
+    // Bumped when a run is dropped so its late chunks and result are ignored.
     run_id: u64,
+    in_flight: Option<tokio::task::AbortHandle>,
+    rows: usize,
     bench: Option<Bench>,
 }
 
@@ -81,8 +83,9 @@ impl Shell {
             connected: HashSet::new(),
             status: String::new(),
             error: None,
-            running: false,
             run_id: 0,
+            in_flight: None,
+            rows: 0,
             bench: None,
         }
     }
@@ -101,36 +104,57 @@ impl Shell {
 
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
         self.selected = Some(id);
-        self.run_id += 1;
-        self.running = false;
+        self.stop();
         self.error = None;
         self.status.clear();
-        self.show_rows(Vec::new(), Vec::new(), cx);
+        self.show_columns(Vec::new(), cx);
         cx.notify();
     }
 
-    fn show_rows(
-        &mut self,
-        columns: Vec<String>,
-        rows: Vec<Vec<serde_json::Value>>,
-        cx: &mut Context<Self>,
-    ) {
+    fn stop(&mut self) {
+        self.run_id += 1;
+        if let Some(task) = self.in_flight.take() {
+            task.abort();
+        }
+    }
+
+    fn show_columns(&mut self, columns: Vec<String>, cx: &mut Context<Self>) {
+        self.rows = 0;
         self.table.update(cx, |table, cx| {
-            table.delegate_mut().set(columns, rows);
+            table.delegate_mut().set(columns, Vec::new());
             table.refresh(cx);
             cx.notify();
         });
     }
 
-    fn run(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running {
-            return;
+    fn show_chunk(&mut self, chunk: QueryChunk, window: &mut Window, cx: &mut Context<Self>) {
+        match chunk {
+            QueryChunk::Columns(columns) => self.show_columns(columns, cx),
+            QueryChunk::Rows(rows) => {
+                if self.rows == 0 {
+                    if let Some(bench) = &self.bench {
+                        bench::first_batch(bench, window);
+                    }
+                }
+                self.rows += rows.len();
+                self.status =
+                    t("editor.rowsRetrieved").replace("{{count}}", &self.rows.to_string());
+                self.table.update(cx, |table, cx| {
+                    table.delegate_mut().append(rows);
+                    cx.notify();
+                });
+            }
         }
+        cx.notify();
+    }
+
+    fn run(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         let Some(connection_id) = self.selected.clone() else {
             self.status = t("sidebar.selectConnection").into();
             cx.notify();
             return;
         };
+        self.stop();
         let input = self.input.read(cx);
         let sql = sql_to_run(&input.selected_value(), &input.value());
         let key = if self.connected.contains(&connection_id) {
@@ -140,46 +164,56 @@ impl Shell {
         };
         self.status = t(key).into();
         self.error = None;
-        self.running = true;
         let (context, cancellation, run_id) =
             (self.context.clone(), self.cancellation.clone(), self.run_id);
         let id = connection_id.clone();
+        let (sender, mut chunks) = tokio::sync::mpsc::unbounded_channel();
         let task = self.runtime.spawn(async move {
-            queries::execute_query(
+            queries::stream_query(
                 &context,
                 &cancellation,
                 QueryRequestScope::DESKTOP,
-                QueryResponsePolicy::Unbounded,
                 id,
                 sql,
                 None,
                 None,
                 None,
-                None,
-                None,
+                move |chunk| {
+                    let _ = sender.send(chunk);
+                },
             )
             .await
         });
+        self.in_flight = Some(task.abort_handle());
         cx.spawn_in(window, async move |this, cx| {
+            while let Some(chunk) = chunks.recv().await {
+                let current = this.update_in(cx, |this, window, cx| {
+                    let current = this.run_id == run_id;
+                    if current {
+                        this.show_chunk(chunk, window, cx);
+                    }
+                    current
+                });
+                if !matches!(current, Ok(true)) {
+                    return;
+                }
+            }
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
             this.update_in(cx, |this, window, cx| {
                 if this.run_id != run_id {
                     return;
                 }
-                this.running = false;
+                this.in_flight = None;
                 match result {
-                    Ok(result) => {
+                    Ok(summary) => {
                         this.connected.insert(connection_id);
                         this.status = format!(
                             "{} \u{b7} {} ms",
-                            t("editor.rowsRetrieved")
-                                .replace("{{count}}", &result.rows.len().to_string()),
-                            result.fetch_time_ms.unwrap_or_default().round()
+                            t("editor.rowsRetrieved").replace("{{count}}", &this.rows.to_string()),
+                            summary.fetch_time_ms.unwrap_or_default().round()
                         );
-                        let count = result.rows.len();
-                        this.show_rows(result.columns, result.rows, cx);
                         if let Some(bench) = this.bench.take() {
-                            bench::loaded(bench, count, this.table.clone(), window);
+                            bench::loaded(bench, this.rows, this.table.clone(), window);
                         }
                     }
                     Err(error) => {
@@ -188,7 +222,7 @@ impl Shell {
                         }
                         this.status.clear();
                         this.error = Some(error);
-                        this.show_rows(Vec::new(), Vec::new(), cx);
+                        this.show_columns(Vec::new(), cx);
                     }
                 }
                 cx.notify();
@@ -263,7 +297,7 @@ impl Render for Shell {
                 Button::new("run")
                     .primary()
                     .label(t("editor.run"))
-                    .disabled(self.selected.is_none() || self.running)
+                    .disabled(self.selected.is_none())
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.run(&RunQuery, window, cx)
                     })),
