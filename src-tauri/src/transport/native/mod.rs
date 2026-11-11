@@ -1,5 +1,6 @@
 mod backend;
 mod bench;
+mod connection_form;
 mod edits;
 mod grid;
 mod i18n;
@@ -10,14 +11,13 @@ mod tests;
 mod theme;
 mod tree;
 
-use crate::commands::QueryCancellationState;
-use crate::runtime::RuntimeContext;
+use crate::runtime::{state::ApplicationState, RuntimeContext};
 use gpui::{App, AppContext as _, WindowOptions};
 use gpui_component::{Root, Theme};
 
 /// Blocks on the main thread until the last window closes. Database work runs on the tokio runtime.
 pub fn run(context: RuntimeContext, runtime: tokio::runtime::Handle) {
-    let cancellation = std::sync::Arc::new(QueryCancellationState::default());
+    let state = std::sync::Arc::new(ApplicationState::default());
     let colors = theme::load(&context);
     let connections = backend::load_redacted_connections(&context.paths.connections_file());
     gpui_platform::application().run(move |cx: &mut App| {
@@ -43,15 +43,7 @@ pub fn run(context: RuntimeContext, runtime: tokio::runtime::Handle) {
         cx.open_window(options, |window, cx| {
             let bench = bench::Bench::from_env();
             let view = cx.new(|cx| {
-                shell::Shell::new(
-                    window,
-                    cx,
-                    colors,
-                    context,
-                    runtime,
-                    cancellation,
-                    connections,
-                )
+                shell::Shell::new(window, cx, colors, context, runtime, state, connections)
             });
             if let Some(bench) = bench {
                 view.update(cx, |shell, cx| shell.start_bench(bench, window, cx));

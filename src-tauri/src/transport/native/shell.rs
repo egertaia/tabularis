@@ -1,5 +1,6 @@
 use super::backend;
 use super::bench::{self, Bench};
+use super::connection_form::{ConnectionForm, FormEvent};
 use super::edits::{self, Source};
 use super::grid::ResultGrid;
 use super::i18n::t;
@@ -12,7 +13,7 @@ use crate::application::queries::QueryRequestScope;
 use crate::commands::QueryCancellationState;
 use crate::drivers::driver_trait::QueryChunk;
 use crate::models::SavedConnection;
-use crate::runtime::RuntimeContext;
+use crate::runtime::{state::ApplicationState, RuntimeContext};
 use gpui::{
     actions, div, prelude::FluentBuilder as _, px, AnyElement, App, AppContext as _, ClickEvent,
     Context, ElementId, Entity, Focusable as _, InteractiveElement as _, IntoElement, KeyBinding,
@@ -20,10 +21,11 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Editor, EditorState, Escape, InputEvent, InputState};
+use gpui_component::notification::Notification;
 use gpui_component::table::{
     DataTable, TableDelegate as _, TableEvent, TableSelection, TableState,
 };
-use gpui_component::Disableable as _;
+use gpui_component::{Disableable as _, Sizable as _, WindowExt as _};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -145,8 +147,10 @@ pub struct Shell {
     colors: Colors,
     context: RuntimeContext,
     runtime: tokio::runtime::Handle,
+    state: Arc<ApplicationState>,
     cancellation: Arc<QueryCancellationState>,
     connections: Result<Vec<SavedConnection>, String>,
+    form: Option<Entity<ConnectionForm>>,
     selected: Option<String>,
     tree: Tree,
     // Bumped on every selection so late metadata replies are ignored.
@@ -162,7 +166,7 @@ impl Shell {
         colors: Colors,
         context: RuntimeContext,
         runtime: tokio::runtime::Handle,
-        cancellation: Arc<QueryCancellationState>,
+        state: Arc<ApplicationState>,
         connections: Result<Vec<SavedConnection>, String>,
     ) -> Self {
         Self {
@@ -170,8 +174,10 @@ impl Shell {
             colors,
             context,
             runtime,
-            cancellation,
+            cancellation: state.query_cancellation.clone(),
+            state,
             connections,
+            form: None,
             selected: None,
             tree: Tree::default(),
             tree_id: 0,
@@ -205,6 +211,120 @@ impl Shell {
         let id = tab.id;
         self.show_columns(id, Vec::new(), cx);
         self.show_tree(connection, cx);
+    }
+
+    fn open_form(
+        &mut self,
+        saved: Option<SavedConnection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = self.runtime.spawn(backend::list_drivers());
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(drivers) = task.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                let index = match &saved {
+                    Some(saved) => drivers
+                        .iter()
+                        .position(|driver| driver.id == saved.params.driver),
+                    None => (!drivers.is_empty()).then_some(0),
+                };
+                let Some(index) = index else {
+                    let driver = saved.map(|saved| saved.params.driver).unwrap_or_default();
+                    let message =
+                        format!("{driver}: {}", t("connections.importFromApp.notInstalled"));
+                    window.push_notification(Notification::error(message), cx);
+                    return;
+                };
+                let (colors, context, state, runtime) = (
+                    this.colors.clone(),
+                    this.context.clone(),
+                    this.state.clone(),
+                    this.runtime.clone(),
+                );
+                let form = cx.new(|cx| {
+                    ConnectionForm::new(
+                        colors, context, state, runtime, drivers, index, saved, window, cx,
+                    )
+                });
+                cx.subscribe_in(&form, window, |this, _, event: &FormEvent, window, cx| {
+                    this.form = None;
+                    if let FormEvent::Saved { plain_text } = event {
+                        this.reload_connections();
+                        if *plain_text {
+                            let message = t("newConnection.secretsStoredInPlainText");
+                            window.push_notification(Notification::warning(message), cx);
+                        }
+                    }
+                    cx.notify();
+                })
+                .detach();
+                this.form = Some(form);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reload_connections(&mut self) {
+        self.connections =
+            backend::load_redacted_connections(&self.context.paths.connections_file());
+    }
+
+    fn confirm_delete(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (shell, id) = (shell.clone(), id.clone());
+            alert
+                .confirm()
+                .title(t("connections.deleteTitle"))
+                .description(t("connections.confirmDelete"))
+                .ok_text(t("common.delete"))
+                .cancel_text(t("common.cancel"))
+                .on_ok(move |_, window, cx| {
+                    shell
+                        .update(cx, |this, cx| this.delete(id.clone(), window, cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+
+    fn delete(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (context, state) = (self.context.clone(), self.state.clone());
+        let task = self.runtime.spawn({
+            let id = id.clone();
+            async move {
+                backend::disconnect_connection(&context, &state, &id).await?;
+                backend::delete_connection(&context, &state, id).await
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => {
+                        this.connected.remove(&id);
+                        if this.selected.as_deref() == Some(id.as_str()) {
+                            this.selected = None;
+                            this.tree = Tree::default();
+                            this.tree_id += 1;
+                        }
+                        this.reload_connections();
+                    }
+                    Err(error) => {
+                        let message = format!("{}\n\nError: {error}", t("connections.failDelete"));
+                        window.push_notification(Notification::error(message), cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn show_tree(&mut self, connection: String, cx: &mut Context<Self>) {
@@ -835,6 +955,7 @@ impl Render for Shell {
                 for conn in connections {
                     let selected = self.selected.as_deref() == Some(&conn.id);
                     let id = conn.id.clone();
+                    let (edit, delete) = (conn.clone(), conn.id.clone());
                     items.push(
                         div()
                             .id(ElementId::from(conn.id.clone()))
@@ -860,9 +981,34 @@ impl Render for Shell {
                             .child(div().truncate().child(conn.name.clone()))
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .text_xs()
                                     .text_color(hsla(&c.text.muted))
-                                    .child(conn.params.driver.clone()),
+                                    .child(div().flex_1().child(conn.params.driver.clone()))
+                                    .child(
+                                        Button::new(ElementId::from(format!("edit{}", conn.id)))
+                                            .ghost()
+                                            .xsmall()
+                                            .label(t("connections.edit"))
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, window, cx| {
+                                                    this.open_form(Some(edit.clone()), window, cx)
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new(ElementId::from(format!("delete{}", conn.id)))
+                                            .ghost()
+                                            .xsmall()
+                                            .label(t("connections.delete"))
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, window, cx| {
+                                                    this.confirm_delete(delete.clone(), window, cx)
+                                                },
+                                            )),
+                                    ),
                             )
                             .into_any_element(),
                     );
@@ -881,7 +1027,22 @@ impl Render for Shell {
             .border_r_1()
             .border_color(hsla(&c.border.subtle))
             .text_color(hsla(&c.text.primary))
-            .child(t("sidebar.connections"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(t("sidebar.connections"))
+                    .child(
+                        Button::new("new-connection")
+                            .ghost()
+                            .xsmall()
+                            .label(t("connections.addConnection"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_form(None, window, cx)
+                            })),
+                    ),
+            )
             .child(list);
         let active = self.tabs.active();
         let active_id = active.id;
@@ -985,8 +1146,9 @@ impl Render for Shell {
                 this.close_tab(this.tabs.active_id(), window, cx)
             }))
             .child(sidebar)
-            .child(
-                div()
+            .child(match &self.form {
+                Some(form) => div().flex_1().h_full().child(form.clone()),
+                None => div()
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -996,6 +1158,6 @@ impl Render for Shell {
                     .child(toolbar)
                     .children(data_toolbar)
                     .child(grid),
-            )
+            })
     }
 }

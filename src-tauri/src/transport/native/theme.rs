@@ -9,7 +9,7 @@ const FALLBACK_ID: &str = "tabularis-dark";
 const BUILTIN: &str = include_str!("../../../../packages/web-ui/src/themes/builtin-themes.json");
 
 // Not `theme_models::Colors`: its semantic keys do not match the legacy theme JSON.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Colors {
     pub bg: Bg,
     pub surface: Surface,
@@ -19,19 +19,19 @@ pub struct Colors {
     pub semantic: Semantic,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Bg {
     pub base: String,
     pub elevated: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Surface {
     pub primary: String,
     pub secondary: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Text {
     pub primary: String,
     pub secondary: String,
@@ -39,14 +39,16 @@ pub struct Text {
     pub accent: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Accent {
     pub primary: String,
     pub secondary: String,
     pub info: String,
+    pub success: String,
+    pub error: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Semantic {
     pub string: String,
     pub number: String,
@@ -55,7 +57,7 @@ pub struct Semantic {
     pub deleted: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Border {
     pub subtle: String,
     pub default: String,

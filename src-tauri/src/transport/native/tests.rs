@@ -165,3 +165,159 @@ async fn a_failed_save_keeps_only_the_changes_that_were_not_written_so_saving_ag
         .collect();
     assert_eq!(names, ["a", "b", "c", "d", "e"]);
 }
+
+#[derive(Default)]
+struct MemorySecrets(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl crate::runtime::secrets::RuntimeSecrets for MemorySecrets {
+    fn get(&self, account: &str) -> Result<Option<String>, String> {
+        Ok(self.0.lock().unwrap().get(account).cloned())
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+        self.0.lock().unwrap().insert(account.into(), secret.into());
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        self.0.lock().unwrap().remove(account);
+        Ok(())
+    }
+}
+
+type ConnectionFixture = (
+    tempfile::TempDir,
+    crate::runtime::RuntimeContext,
+    std::sync::Arc<crate::runtime::state::ApplicationState>,
+    std::sync::Arc<MemorySecrets>,
+);
+
+fn connection_fixture() -> ConnectionFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let secrets = std::sync::Arc::new(MemorySecrets::default());
+    let context = crate::runtime::RuntimeContext::new(
+        std::sync::Arc::new(crate::runtime::paths::FixedRuntimePaths::new(
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+        )),
+        std::sync::Arc::new(crate::runtime::events::NoopRuntimeEvents),
+        secrets.clone(),
+    );
+    (temp, context, Default::default(), secrets)
+}
+
+fn listed(context: &crate::runtime::RuntimeContext) -> Vec<crate::models::SavedConnection> {
+    super::backend::load_redacted_connections(&context.paths.connections_file()).unwrap()
+}
+
+fn sqlite_values(name: &str, path: &str) -> super::connection_form::Values {
+    super::connection_form::Values {
+        name: name.into(),
+        database: path.into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn saving_a_new_sqlite_connection_from_the_form_stores_it_and_it_appears_in_the_connection_list(
+) {
+    use crate::drivers::driver_trait::DatabaseDriver as _;
+    let (temp, context, state, _) = connection_fixture();
+    let sqlite = crate::drivers::sqlite::SqliteDriver::new()
+        .manifest()
+        .clone();
+    let path = temp.path().join("app.db").to_string_lossy().into_owned();
+    let values = sqlite_values("Local", &path);
+    assert_eq!(
+        super::connection_form::save_error(&sqlite, None, &values),
+        None
+    );
+
+    let params = super::connection_form::params(&sqlite, None, &values);
+    let saved = super::backend::save_connection(&context, &state, values.name, params)
+        .await
+        .unwrap();
+
+    let connections = listed(&context);
+    assert_eq!(connections.len(), 1);
+    assert_eq!(connections[0].id, saved.id);
+    assert_eq!(connections[0].name, "Local");
+    assert_eq!(connections[0].params.driver, "sqlite");
+    assert_eq!(connections[0].params.database.primary(), path);
+}
+
+#[tokio::test]
+async fn editing_a_connection_without_typing_a_password_keeps_the_stored_password() {
+    use crate::drivers::driver_trait::DatabaseDriver as _;
+    use crate::runtime::secrets::RuntimeSecrets as _;
+    let (_temp, context, state, secrets) = connection_fixture();
+    let postgres = crate::drivers::postgres::PostgresDriver::new()
+        .manifest()
+        .clone();
+    let typed = super::connection_form::Values {
+        name: "Server".into(),
+        host: "db.internal".into(),
+        port: "5432".into(),
+        username: "app".into(),
+        password: "stored-secret".into(),
+        database: "sales".into(),
+        read_only: false,
+    };
+    let params = super::connection_form::params(&postgres, None, &typed);
+    let saved = super::backend::save_connection(&context, &state, typed.name.clone(), params)
+        .await
+        .unwrap();
+    let account = format!("{}:db", saved.id);
+    assert_eq!(
+        secrets.get(&account).unwrap().as_deref(),
+        Some("stored-secret")
+    );
+
+    let editing = listed(&context).remove(0);
+    let edited = super::connection_form::Values {
+        name: "Renamed".into(),
+        password: String::new(),
+        ..typed
+    };
+    let params = super::connection_form::params(&postgres, Some(&editing.params), &edited);
+    assert_eq!(params.password, None);
+    super::backend::update_connection(&context, &state, &editing, edited.name, params)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        secrets.get(&account).unwrap().as_deref(),
+        Some("stored-secret")
+    );
+    let persisted = crate::persistence::load_connections_file(&context.paths.connections_file())
+        .unwrap()
+        .connections
+        .remove(0);
+    assert_eq!(persisted.name, "Renamed");
+    assert_eq!(persisted.params.password, None);
+    assert_eq!(persisted.params.save_in_keychain, Some(true));
+}
+
+#[tokio::test]
+async fn deleting_a_connection_removes_it_from_the_list() {
+    use crate::drivers::driver_trait::DatabaseDriver as _;
+    let (temp, context, state, _) = connection_fixture();
+    let sqlite = crate::drivers::sqlite::SqliteDriver::new()
+        .manifest()
+        .clone();
+    let path = temp.path().join("app.db").to_string_lossy().into_owned();
+    let values = sqlite_values("Doomed", &path);
+    let params = super::connection_form::params(&sqlite, None, &values);
+    let saved = super::backend::save_connection(&context, &state, values.name, params)
+        .await
+        .unwrap();
+
+    super::backend::disconnect_connection(&context, &state, &saved.id)
+        .await
+        .unwrap();
+    super::backend::delete_connection(&context, &state, saved.id)
+        .await
+        .unwrap();
+
+    assert!(listed(&context).is_empty());
+}
