@@ -1,6 +1,7 @@
 use super::bench::{self, Bench};
 use super::grid::ResultGrid;
 use super::i18n::t;
+use super::tabs::Tabs;
 use super::theme::hsla;
 use super::theme::Colors;
 use super::tree::{Child, Load, Node, RowKind, Tree};
@@ -22,7 +23,7 @@ use gpui_component::Disableable as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-actions!(native, [RunQuery]);
+actions!(native, [RunQuery, NewTab, CloseTab]);
 
 pub fn bind_keys(cx: &mut App) {
     // The input binds the same keys to Enter, so this must come after gpui_component::init.
@@ -32,6 +33,15 @@ pub fn bind_keys(cx: &mut App) {
         "ctrl-enter"
     };
     cx.bind_keys([KeyBinding::new(key, RunQuery, Some("Input"))]);
+    let (new_tab, close_tab) = if cfg!(target_os = "macos") {
+        ("cmd-t", "cmd-w")
+    } else {
+        ("ctrl-t", "ctrl-w")
+    };
+    cx.bind_keys([
+        KeyBinding::new(new_tab, NewTab, None),
+        KeyBinding::new(close_tab, CloseTab, None),
+    ]);
 }
 
 pub(super) fn sql_to_run(selected: &str, whole: &str) -> String {
@@ -66,6 +76,40 @@ async fn fetch(context: RuntimeContext, id: String, job: Job) -> Result<Vec<Chil
     }
 }
 
+struct TabView {
+    connection: Option<String>,
+    // Schema and database of the last opened table, used by the next run.
+    scope: Location,
+    input: Entity<EditorState>,
+    table: Entity<TableState<ResultGrid>>,
+    status: String,
+    error: Option<String>,
+    rows: usize,
+    // Result sets seen in the current run; only the first is shown.
+    sets: usize,
+    bench: Option<Bench>,
+}
+
+fn new_view(
+    colors: &Colors,
+    connection: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> TabView {
+    let grid = ResultGrid::new(hsla(&colors.text.primary), hsla(&colors.text.muted));
+    TabView {
+        connection,
+        scope: Location::default(),
+        input: cx.new(|cx| EditorState::new(window, cx).language("sql")),
+        table: cx.new(|cx| TableState::new(grid, window, cx).col_movable(false)),
+        status: String::new(),
+        error: None,
+        rows: 0,
+        sets: 0,
+        bench: None,
+    }
+}
+
 pub struct Shell {
     colors: Colors,
     context: RuntimeContext,
@@ -76,20 +120,8 @@ pub struct Shell {
     tree: Tree,
     // Bumped on every selection so late metadata replies are ignored.
     tree_id: u64,
-    // Schema and database of the last opened table, used by the next run.
-    scope: Location,
     connected: HashSet<String>,
-    input: Entity<EditorState>,
-    table: Entity<TableState<ResultGrid>>,
-    status: String,
-    error: Option<String>,
-    // Bumped when a run is dropped so its late chunks and result are ignored.
-    run_id: u64,
-    in_flight: Option<tokio::task::AbortHandle>,
-    rows: usize,
-    // Result sets seen in the current run; only the first is shown.
-    sets: usize,
-    bench: Option<Bench>,
+    tabs: Tabs<TabView>,
 }
 
 impl Shell {
@@ -102,10 +134,8 @@ impl Shell {
         cancellation: Arc<QueryCancellationState>,
         connections: Result<Vec<SavedConnection>, String>,
     ) -> Self {
-        let grid = ResultGrid::new(hsla(&colors.text.primary), hsla(&colors.text.muted));
         Self {
-            input: cx.new(|cx| EditorState::new(window, cx).language("sql")),
-            table: cx.new(|cx| TableState::new(grid, window, cx).col_movable(false)),
+            tabs: Tabs::new(new_view(&colors, None, window, cx)),
             colors,
             context,
             runtime,
@@ -114,45 +144,67 @@ impl Shell {
             selected: None,
             tree: Tree::default(),
             tree_id: 0,
-            scope: Location::default(),
             connected: HashSet::new(),
-            status: String::new(),
-            error: None,
-            run_id: 0,
-            in_flight: None,
-            rows: 0,
-            sets: 0,
-            bench: None,
         }
     }
 
     pub fn start_bench(&mut self, bench: Bench, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(bench.connection.clone(), cx);
-        self.input.update(cx, |input, cx| {
+        self.pick(bench.connection.clone(), cx);
+        let id = self.tabs.active_id();
+        let view = &mut self.tabs.active_mut().view;
+        view.input.update(cx, |input, cx| {
             input.set_value(bench.sql.clone(), window, cx)
         });
-        self.bench = Some(Bench {
+        view.bench = Some(Bench {
             start: std::time::Instant::now(),
             ..bench
         });
-        self.run(&RunQuery, window, cx);
+        self.run(id, window, cx);
     }
 
-    fn select(&mut self, id: String, cx: &mut Context<Self>) {
-        self.selected = Some(id);
+    fn pick(&mut self, connection: String, cx: &mut Context<Self>) {
+        let tab = self.tabs.active_mut();
+        tab.stream.stop();
+        let view = &mut tab.view;
+        view.connection = Some(connection.clone());
+        view.scope = Location::default();
+        view.error = None;
+        view.status.clear();
+        let id = tab.id;
+        self.show_columns(id, Vec::new(), cx);
+        self.show_tree(connection, cx);
+    }
+
+    fn show_tree(&mut self, connection: String, cx: &mut Context<Self>) {
+        self.selected = Some(connection);
         self.tree = Tree::default();
         self.tree_id += 1;
-        self.scope = Location::default();
-        self.stop();
-        self.error = None;
-        self.status.clear();
-        self.show_columns(Vec::new(), cx);
+        self.tree.root = Some(Load::Idle);
+        self.load(Vec::new(), cx);
         cx.notify();
     }
 
-    fn load_root(&mut self, cx: &mut Context<Self>) {
-        self.tree.root = Some(Load::Idle);
-        self.load(Vec::new(), cx);
+    fn activate(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.tabs.select(id);
+        let connection = self.tabs.active_mut().view.connection.clone();
+        if connection.is_some() && connection != self.selected {
+            self.show_tree(connection.unwrap_or_default(), cx);
+        }
+        cx.notify();
+    }
+
+    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        let view = new_view(&self.colors, self.selected.clone(), window, cx);
+        self.tabs.open(None, None, view);
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let colors = &self.colors;
+        let selected = self.selected.clone();
+        self.tabs
+            .close(id, || new_view(colors, selected, window, cx));
+        self.activate(self.tabs.active_id(), cx);
     }
 
     fn load(&mut self, path: Vec<usize>, cx: &mut Context<Self>) {
@@ -215,9 +267,19 @@ impl Shell {
             return;
         };
         let (location, name) = (node.location.clone(), node.entry.name.clone());
+        let key = format!(
+            "{connection_id}|{:?}|{:?}|{name}",
+            location.database, location.schema
+        );
+        if let Some(id) = self.tabs.find(&key) {
+            self.activate(id, cx);
+            return;
+        }
         let (context, tree_id) = (self.context.clone(), self.tree_id);
+        let title = name.clone();
         let task = {
             let location = location.clone();
+            let connection_id = connection_id.clone();
             self.runtime.spawn(async move {
                 explorer::open_table_query(&context, &connection_id, &location, &name).await
             })
@@ -230,13 +292,19 @@ impl Shell {
                 }
                 match result {
                     Ok(sql) => {
-                        this.scope = location;
-                        this.input
+                        if let Some(id) = this.tabs.find(&key) {
+                            this.activate(id, cx);
+                            return;
+                        }
+                        let mut view = new_view(&this.colors, Some(connection_id), window, cx);
+                        view.scope = location;
+                        view.input
                             .update(cx, |input, cx| input.set_value(sql, window, cx));
-                        this.run(&RunQuery, window, cx);
+                        let id = this.tabs.open(Some(title), Some(key), view);
+                        this.run(id, window, cx);
                     }
                     Err(error) => {
-                        this.error = Some(error);
+                        this.tabs.active_mut().view.error = Some(error);
                         cx.notify();
                     }
                 }
@@ -306,41 +374,46 @@ impl Shell {
             .collect()
     }
 
-    fn stop(&mut self) {
-        self.run_id += 1;
-        if let Some(task) = self.in_flight.take() {
-            task.abort();
-        }
-    }
-
-    fn show_columns(&mut self, columns: Vec<String>, cx: &mut Context<Self>) {
-        self.rows = 0;
-        self.table.update(cx, |table, cx| {
+    fn show_columns(&mut self, id: u64, columns: Vec<String>, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return;
+        };
+        tab.view.rows = 0;
+        tab.view.table.update(cx, |table, cx| {
             table.delegate_mut().set(columns, Vec::new());
             table.refresh(cx);
             cx.notify();
         });
     }
 
-    fn show_chunk(&mut self, chunk: QueryChunk, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_chunk(
+        &mut self,
+        id: u64,
+        chunk: QueryChunk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.tabs.get_mut(id).map(|tab| &mut tab.view) else {
+            return;
+        };
         if matches!(chunk, QueryChunk::Columns(_)) {
-            self.sets += 1;
+            view.sets += 1;
         }
-        if self.sets > 1 {
+        if view.sets > 1 {
             return;
         }
         match chunk {
-            QueryChunk::Columns(columns) => self.show_columns(columns, cx),
+            QueryChunk::Columns(columns) => self.show_columns(id, columns, cx),
             QueryChunk::Rows(rows) => {
-                if self.rows == 0 {
-                    if let Some(bench) = &self.bench {
+                if view.rows == 0 {
+                    if let Some(bench) = &view.bench {
                         bench::first_batch(bench, window);
                     }
                 }
-                self.rows += rows.len();
-                self.status =
-                    t("editor.rowsRetrieved").replace("{{count}}", &self.rows.to_string());
-                self.table.update(cx, |table, cx| {
+                view.rows += rows.len();
+                view.status =
+                    t("editor.rowsRetrieved").replace("{{count}}", &view.rows.to_string());
+                view.table.update(cx, |table, cx| {
                     table.delegate_mut().append(rows);
                     cx.notify();
                 });
@@ -349,34 +422,42 @@ impl Shell {
         cx.notify();
     }
 
-    fn run(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(connection_id) = self.selected.clone() else {
-            self.status = t("sidebar.selectConnection").into();
+    fn run_active(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(self.tabs.active_id(), window, cx);
+    }
+
+    fn run(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return;
+        };
+        let Some(connection_id) = tab.view.connection.clone() else {
+            tab.view.status = t("sidebar.selectConnection").into();
             cx.notify();
             return;
         };
-        self.stop();
-        let input = self.input.read(cx);
+        tab.stream.stop();
+        let run_id = tab.stream.id();
+        let view = &mut tab.view;
+        let input = view.input.read(cx);
         let sql = sql_to_run(&input.selected_value(), &input.value());
         let key = if self.connected.contains(&connection_id) {
             "editor.executingQuery"
         } else {
             "connections.connecting"
         };
-        self.status = t(key).into();
-        self.error = None;
-        self.sets = 0;
-        let (context, cancellation, run_id) =
-            (self.context.clone(), self.cancellation.clone(), self.run_id);
-        let id = connection_id.clone();
-        let scope = self.scope.clone();
+        view.status = t(key).into();
+        view.error = None;
+        view.sets = 0;
+        let (context, cancellation) = (self.context.clone(), self.cancellation.clone());
+        let id_for_task = connection_id.clone();
+        let scope = view.scope.clone();
         let (sender, mut chunks) = tokio::sync::mpsc::unbounded_channel();
         let task = self.runtime.spawn(async move {
             queries::stream_query(
                 &context,
                 &cancellation,
                 QueryRequestScope::DESKTOP,
-                id,
+                id_for_task,
                 sql,
                 scope.schema,
                 None,
@@ -387,13 +468,16 @@ impl Shell {
             )
             .await
         });
-        self.in_flight = Some(task.abort_handle());
+        tab.stream.start(task.abort_handle());
         cx.spawn_in(window, async move |this, cx| {
             while let Some(chunk) = chunks.recv().await {
                 let current = this.update_in(cx, |this, window, cx| {
-                    let current = this.run_id == run_id;
+                    let current = this
+                        .tabs
+                        .get_mut(id)
+                        .is_some_and(|tab| tab.stream.id() == run_id);
                     if current {
-                        this.show_chunk(chunk, window, cx);
+                        this.show_chunk(id, chunk, window, cx);
                     }
                     current
                 });
@@ -403,29 +487,33 @@ impl Shell {
             }
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
             this.update_in(cx, |this, window, cx| {
-                if this.run_id != run_id {
+                let Some(tab) = this.tabs.get_mut(id) else {
+                    return;
+                };
+                if tab.stream.id() != run_id {
                     return;
                 }
-                this.in_flight = None;
+                tab.stream.finish();
+                let view = &mut tab.view;
                 match result {
                     Ok(summary) => {
                         this.connected.insert(connection_id);
-                        this.status = format!(
+                        view.status = format!(
                             "{} \u{b7} {} ms",
-                            t("editor.rowsRetrieved").replace("{{count}}", &this.rows.to_string()),
+                            t("editor.rowsRetrieved").replace("{{count}}", &view.rows.to_string()),
                             summary.fetch_time_ms.unwrap_or_default().round()
                         );
-                        if let Some(bench) = this.bench.take() {
-                            bench::loaded(bench, this.rows, this.table.clone(), window);
+                        if let Some(bench) = view.bench.take() {
+                            bench::loaded(bench, view.rows, view.table.clone(), window);
                         }
                     }
                     Err(error) => {
-                        if this.bench.is_some() {
+                        if view.bench.is_some() {
                             bench::fail(&error);
                         }
-                        this.status.clear();
-                        this.error = Some(error);
-                        this.show_columns(Vec::new(), cx);
+                        view.status.clear();
+                        view.error = Some(error);
+                        this.show_columns(id, Vec::new(), cx);
                     }
                 }
                 cx.notify();
@@ -470,8 +558,7 @@ impl Render for Shell {
                             .hover(|d| d.bg(hsla(&c.bg.elevated)))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.select(id.clone(), cx);
-                                this.load_root(cx);
+                                this.pick(id.clone(), cx);
                             }))
                             .child(div().truncate().child(conn.name.clone()))
                             .child(
@@ -499,6 +586,62 @@ impl Render for Shell {
             .text_color(hsla(&c.text.primary))
             .child(t("sidebar.connections"))
             .child(list);
+        let active = self.tabs.active();
+        let active_id = active.id;
+        let view = &active.view;
+        let mut bar = div().flex().items_center().gap_1().px_2().pt_1();
+        for tab in self.tabs.items() {
+            let id = tab.id;
+            let current = id == active_id;
+            bar =
+                bar.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if current {
+                            hsla(&c.border.focus)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .bg(if current {
+                            hsla(&c.bg.elevated)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .child(
+                            div()
+                                .id(ElementId::from(format!("tab{id}")))
+                                .px_2()
+                                .max_w(px(160.))
+                                .truncate()
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.activate(id, cx)
+                                }))
+                                .child(tab.title.clone()),
+                        )
+                        .child(
+                            Button::new(ElementId::from(format!("close{id}")))
+                                .ghost()
+                                .label("\u{d7}")
+                                .tooltip(t("editor.closeTab"))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.close_tab(id, window, cx)
+                                })),
+                        ),
+                );
+        }
+        let bar = bar.child(
+            Button::new("new-tab")
+                .ghost()
+                .label("+")
+                .tooltip(t("editor.newConsole"))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.new_tab(&NewTab, window, cx)
+                })),
+        );
         let toolbar = div()
             .flex()
             .items_center()
@@ -508,32 +651,36 @@ impl Render for Shell {
                 Button::new("run")
                     .primary()
                     .label(t("editor.run"))
-                    .disabled(self.selected.is_none())
+                    .disabled(view.connection.is_none())
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.run(&RunQuery, window, cx)
+                        this.run_active(&RunQuery, window, cx)
                     })),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(hsla(&c.text.muted))
-                    .child(self.status.clone()),
+                    .child(view.status.clone()),
             );
         let grid = div()
             .flex_1()
             .min_h_0()
             .w_full()
             .bg(hsla(&c.bg.base))
-            .child(match &self.error {
+            .child(match &view.error {
                 Some(error) => div().p_3().child(error.clone()).into_any_element(),
-                None => DataTable::new(&self.table).into_any_element(),
+                None => DataTable::new(&view.table).into_any_element(),
             });
         div()
             .size_full()
             .flex()
             .bg(hsla(&c.bg.base))
             .text_color(hsla(&c.text.primary))
-            .on_action(cx.listener(Self::run))
+            .on_action(cx.listener(Self::run_active))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                this.close_tab(this.tabs.active_id(), window, cx)
+            }))
             .child(sidebar)
             .child(
                 div()
@@ -541,7 +688,8 @@ impl Render for Shell {
                     .flex_col()
                     .flex_1()
                     .h_full()
-                    .child(Editor::new(&self.input).h(px(160.)))
+                    .child(bar)
+                    .child(Editor::new(&view.input).h(px(160.)))
                     .child(toolbar)
                     .child(grid),
             )

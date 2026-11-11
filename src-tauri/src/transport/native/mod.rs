@@ -2,6 +2,7 @@ mod bench;
 mod grid;
 mod i18n;
 mod shell;
+mod tabs;
 #[cfg(test)]
 mod tests;
 mod theme;
