@@ -1,3 +1,4 @@
+mod bench;
 mod grid;
 mod i18n;
 mod shell;
@@ -34,6 +35,7 @@ pub fn run(context: RuntimeContext, runtime: tokio::runtime::Handle) {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
+            let bench = bench::Bench::from_env();
             let view = cx.new(|cx| {
                 shell::Shell::new(
                     window,
@@ -45,6 +47,9 @@ pub fn run(context: RuntimeContext, runtime: tokio::runtime::Handle) {
                     connections,
                 )
             });
+            if let Some(bench) = bench {
+                view.update(cx, |shell, cx| shell.start_bench(bench, window, cx));
+            }
             cx.new(|cx| Root::new(view, window, cx))
         })
         .expect("Failed to open window");

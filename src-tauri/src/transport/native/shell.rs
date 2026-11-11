@@ -1,3 +1,4 @@
+use super::bench::{self, Bench};
 use super::grid::ResultGrid;
 use super::i18n::t;
 use super::theme::Colors;
@@ -45,6 +46,7 @@ pub struct Shell {
     running: bool,
     // Bumped when the selection changes so a late result is dropped.
     run_id: u64,
+    bench: Option<Bench>,
 }
 
 impl Shell {
@@ -72,7 +74,20 @@ impl Shell {
             error: None,
             running: false,
             run_id: 0,
+            bench: None,
         }
+    }
+
+    pub fn start_bench(&mut self, bench: Bench, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(bench.connection.clone(), cx);
+        self.input.update(cx, |input, cx| {
+            input.set_value(bench.sql.clone(), window, cx)
+        });
+        self.bench = Some(Bench {
+            start: std::time::Instant::now(),
+            ..bench
+        });
+        self.run(&RunQuery, window, cx);
     }
 
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
@@ -98,7 +113,7 @@ impl Shell {
         });
     }
 
-    fn run(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+    fn run(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
             return;
         }
@@ -135,9 +150,9 @@ impl Shell {
             )
             .await
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 if this.run_id != run_id {
                     return;
                 }
@@ -151,9 +166,16 @@ impl Shell {
                                 .replace("{{count}}", &result.rows.len().to_string()),
                             result.fetch_time_ms.unwrap_or_default().round()
                         );
+                        let count = result.rows.len();
                         this.show_rows(result.columns, result.rows, cx);
+                        if let Some(bench) = this.bench.take() {
+                            bench::loaded(bench, count, this.table.clone(), window);
+                        }
                     }
                     Err(error) => {
+                        if this.bench.is_some() {
+                            bench::fail(&error);
+                        }
                         this.status.clear();
                         this.error = Some(error);
                         this.show_rows(Vec::new(), Vec::new(), cx);

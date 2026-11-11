@@ -1,3 +1,4 @@
+use super::bench::percentile;
 use super::grid::format_cell;
 use super::i18n::t;
 use super::theme::colors_from_source;
@@ -25,4 +26,12 @@ fn formats_cells_as_text() {
     assert_eq!(format_cell(&json!("a\"b")), "a\"b");
     assert_eq!(format_cell(&json!(1.5)), "1.5");
     assert_eq!(format_cell(&json!({"k": [1, true]})), r#"{"k":[1,true]}"#);
+}
+
+#[test]
+fn nearest_rank_percentiles_of_known_slice() {
+    let sorted: Vec<f64> = (1..=100).map(f64::from).collect();
+    assert_eq!(percentile(&sorted, 50.), 50.);
+    assert_eq!(percentile(&sorted, 99.), 99.);
+    assert_eq!(percentile(&[7.], 99.), 7.);
 }
