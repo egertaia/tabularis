@@ -19,7 +19,10 @@ pub fn run(context: RuntimeContext, runtime: tokio::runtime::Handle) {
     let connections = connections::load_redacted_connections(&context.paths.connections_file());
     gpui_platform::application().run(move |cx: &mut App| {
         gpui_component::init(cx);
-        Theme::update(cx, |t| theme::apply(&colors, &mut t.colors));
+        Theme::update(cx, |t| {
+            theme::apply(&colors, &mut t.colors);
+            t.highlight_theme = theme::highlight_theme(&colors);
+        });
         shell::bind_keys(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {

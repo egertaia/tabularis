@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_component::Disableable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::input::{Editor, EditorState};
 use gpui_component::table::{DataTable, TableState};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -31,6 +31,15 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new(key, RunQuery, Some("Input"))]);
 }
 
+pub(super) fn sql_to_run(selected: &str, whole: &str) -> String {
+    let sql = if selected.trim().is_empty() {
+        whole
+    } else {
+        selected
+    };
+    sql.to_string()
+}
+
 pub struct Shell {
     colors: Colors,
     context: RuntimeContext,
@@ -39,7 +48,7 @@ pub struct Shell {
     connections: Result<Vec<SavedConnection>, String>,
     selected: Option<String>,
     connected: HashSet<String>,
-    input: Entity<TextareaState>,
+    input: Entity<EditorState>,
     table: Entity<TableState<ResultGrid>>,
     status: String,
     error: Option<String>,
@@ -61,7 +70,7 @@ impl Shell {
     ) -> Self {
         let grid = ResultGrid::new(hsla(&colors.text.primary), hsla(&colors.text.muted));
         Self {
-            input: cx.new(|cx| TextareaState::new(window, cx)),
+            input: cx.new(|cx| EditorState::new(window, cx).language("sql")),
             table: cx.new(|cx| TableState::new(grid, window, cx).col_movable(false)),
             colors,
             context,
@@ -122,7 +131,8 @@ impl Shell {
             cx.notify();
             return;
         };
-        let sql = self.input.read(cx).value().to_string();
+        let input = self.input.read(cx);
+        let sql = sql_to_run(&input.selected_value(), &input.value());
         let key = if self.connected.contains(&connection_id) {
             "editor.executingQuery"
         } else {
@@ -286,7 +296,7 @@ impl Render for Shell {
                     .flex_col()
                     .flex_1()
                     .h_full()
-                    .child(Textarea::new(&self.input).h(px(96.)))
+                    .child(Editor::new(&self.input).h(px(160.)))
                     .child(toolbar)
                     .child(grid),
             )

@@ -1,6 +1,7 @@
 use crate::application::{persistence, themes};
 use crate::runtime::RuntimeContext;
 use gpui::{Hsla, Rgba};
+use gpui_component::highlighter::HighlightTheme;
 use gpui_component::theme::ThemeColor;
 use serde::Deserialize;
 
@@ -15,6 +16,7 @@ pub struct Colors {
     pub text: Text,
     pub accent: Accent,
     pub border: Border,
+    pub semantic: Semantic,
 }
 
 #[derive(Deserialize)]
@@ -32,12 +34,22 @@ pub struct Surface {
 #[derive(Deserialize)]
 pub struct Text {
     pub primary: String,
+    pub secondary: String,
     pub muted: String,
+    pub accent: String,
 }
 
 #[derive(Deserialize)]
 pub struct Accent {
     pub primary: String,
+    pub secondary: String,
+    pub info: String,
+}
+
+#[derive(Deserialize)]
+pub struct Semantic {
+    pub string: String,
+    pub number: String,
 }
 
 #[derive(Deserialize)]
@@ -95,4 +107,27 @@ pub fn apply(c: &Colors, t: &mut ThemeColor) {
     t.table_head_foreground = hsla(&c.text.muted);
     t.table_row_border = hsla(&c.border.subtle);
     t.table_hover = hsla(&c.bg.elevated);
+}
+
+pub fn highlight_theme(c: &Colors) -> std::sync::Arc<HighlightTheme> {
+    let style = |color: &str| serde_json::json!({ "color": color });
+    let theme = serde_json::json!({
+        "name": "tabularis",
+        "style": {
+            "editor.background": c.bg.base,
+            "editor.foreground": c.text.primary,
+            "editor.line_number": c.text.muted,
+            "syntax": {
+                "keyword": style(&c.text.accent),
+                "string": style(&c.semantic.string),
+                "number": style(&c.semantic.number),
+                "comment": style(&c.text.muted),
+                "operator": style(&c.text.secondary),
+                "punctuation": style(&c.text.secondary),
+                "function": style(&c.accent.secondary),
+                "type": style(&c.accent.info),
+            },
+        },
+    });
+    std::sync::Arc::new(serde_json::from_value(theme).expect("highlight theme matches schema"))
 }

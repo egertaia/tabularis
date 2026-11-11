@@ -1,6 +1,7 @@
 use super::bench::percentile;
 use super::grid::format_cell;
 use super::i18n::t;
+use super::shell::sql_to_run;
 use super::theme::colors_from_source;
 
 #[test]
@@ -34,4 +35,11 @@ fn nearest_rank_percentiles_of_known_slice() {
     assert_eq!(percentile(&sorted, 50.), 50.);
     assert_eq!(percentile(&sorted, 99.), 99.);
     assert_eq!(percentile(&[7.], 99.), 7.);
+}
+
+#[test]
+fn runs_selection_else_whole_buffer() {
+    assert_eq!(sql_to_run("select 2", "select 1; select 2"), "select 2");
+    assert_eq!(sql_to_run("", "select 1"), "select 1");
+    assert_eq!(sql_to_run("  \n", "select 1"), "select 1");
 }
