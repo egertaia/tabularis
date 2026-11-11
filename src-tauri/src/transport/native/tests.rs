@@ -92,3 +92,76 @@ fn a_query_running_in_one_tab_keeps_running_when_another_tab_is_selected_and_clo
     tabs.close(running, || ());
     assert!(runtime.block_on(task).unwrap_err().is_cancelled());
 }
+
+fn items_source() -> super::edits::Source {
+    let column = |name: &str, is_pk: bool| -> crate::models::TableColumn {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "data_type": "TEXT",
+            "is_pk": is_pk,
+            "is_nullable": !is_pk,
+            "is_auto_increment": false,
+        }))
+        .unwrap()
+    };
+    super::edits::Source {
+        connection_id: "missing".into(),
+        location: Default::default(),
+        table: "items".into(),
+        sql: "SELECT * FROM items".into(),
+        columns: vec![column("id", true), column("name", false)],
+    }
+}
+
+#[test]
+fn a_result_that_is_not_editable_offers_no_editing() {
+    let source = items_source();
+    let result = ["id".to_string(), "name".to_string()];
+    assert_eq!(source.keys("SELECT * FROM items", &result), Some(vec![0]));
+    assert_eq!(source.keys("SELECT name FROM items", &result), None);
+    assert_eq!(source.keys("SELECT * FROM items", &result[1..]), None);
+    let keyless = super::edits::Source {
+        columns: source.columns.into_iter().skip(1).collect(),
+        ..items_source()
+    };
+    assert_eq!(keyless.keys("SELECT * FROM items", &result), None);
+}
+
+#[tokio::test]
+async fn a_failed_save_keeps_only_the_changes_that_were_not_written_so_saving_again_does_not_write_a_row_twice(
+) {
+    use crate::application::records::tests::{items, items_fixture};
+    use serde_json::{json, Value};
+    let (_temp, context, database) = items_fixture(false).await;
+    let source = super::edits::Source {
+        connection_id: "items".into(),
+        ..items_source()
+    };
+    let result = ["id".to_string(), "name".to_string()];
+    let mut edits = super::edits::Edits::default();
+    edits.insert(vec![json!(4), json!("d")]);
+    edits.insert(vec![json!(5), Value::Null]);
+    let original = |_, _| Value::Null;
+
+    let ops = edits.ops(&source, &result, &[0], original).unwrap();
+    let error = super::edits::save(&context, &source, ops)
+        .await
+        .err()
+        .unwrap();
+    edits.forget(&error.applied);
+
+    assert_eq!(items(&database).await.len(), 4);
+    assert_eq!(edits.count(), 1);
+    assert_eq!(edits.inserted(), [vec![json!(5), Value::Null]]);
+
+    edits.edit_new(0, 1, json!("e"));
+    let ops = edits.ops(&source, &result, &[0], original).unwrap();
+    assert!(super::edits::save(&context, &source, ops).await.is_ok());
+
+    let names: Vec<_> = items(&database)
+        .await
+        .into_iter()
+        .map(|row| row.1)
+        .collect();
+    assert_eq!(names, ["a", "b", "c", "d", "e"]);
+}

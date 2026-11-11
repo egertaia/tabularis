@@ -1,4 +1,5 @@
 mod bench;
+mod edits;
 mod grid;
 mod i18n;
 mod shell;

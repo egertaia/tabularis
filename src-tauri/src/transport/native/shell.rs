@@ -1,4 +1,5 @@
 use super::bench::{self, Bench};
+use super::edits::{self, Source};
 use super::grid::ResultGrid;
 use super::i18n::t;
 use super::tabs::Tabs;
@@ -12,18 +13,21 @@ use crate::drivers::driver_trait::QueryChunk;
 use crate::models::SavedConnection;
 use crate::runtime::RuntimeContext;
 use gpui::{
-    actions, div, px, AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    actions, div, prelude::FluentBuilder as _, px, AnyElement, App, AppContext as _, ClickEvent,
+    Context, ElementId, Entity, Focusable as _, InteractiveElement as _, IntoElement, KeyBinding,
+    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Editor, EditorState};
-use gpui_component::table::{DataTable, TableState};
+use gpui_component::input::{Editor, EditorState, Escape, InputEvent, InputState};
+use gpui_component::table::{
+    DataTable, TableDelegate as _, TableEvent, TableSelection, TableState,
+};
 use gpui_component::Disableable as _;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-actions!(native, [RunQuery, NewTab, CloseTab]);
+actions!(native, [RunQuery, NewTab, CloseTab, SaveEdits, EditCell]);
 
 pub fn bind_keys(cx: &mut App) {
     // The input binds the same keys to Enter, so this must come after gpui_component::init.
@@ -33,14 +37,16 @@ pub fn bind_keys(cx: &mut App) {
         "ctrl-enter"
     };
     cx.bind_keys([KeyBinding::new(key, RunQuery, Some("Input"))]);
-    let (new_tab, close_tab) = if cfg!(target_os = "macos") {
-        ("cmd-t", "cmd-w")
+    let (new_tab, close_tab, save) = if cfg!(target_os = "macos") {
+        ("cmd-t", "cmd-w", "cmd-s")
     } else {
-        ("ctrl-t", "ctrl-w")
+        ("ctrl-t", "ctrl-w", "ctrl-s")
     };
     cx.bind_keys([
         KeyBinding::new(new_tab, NewTab, None),
         KeyBinding::new(close_tab, CloseTab, None),
+        KeyBinding::new(save, SaveEdits, None),
+        KeyBinding::new("enter", EditCell, Some("DataTable")),
     ]);
 }
 
@@ -80,6 +86,12 @@ struct TabView {
     connection: Option<String>,
     // Schema and database of the last opened table, used by the next run.
     scope: Location,
+    // Set when the tab was opened from a table the grid may edit.
+    source: Option<Arc<Source>>,
+    // Primary key columns of the shown result, when it may be edited.
+    keys: Option<Vec<usize>>,
+    sql: String,
+    saving: bool,
     input: Entity<EditorState>,
     table: Entity<TableState<ResultGrid>>,
     status: String,
@@ -93,15 +105,33 @@ struct TabView {
 fn new_view(
     colors: &Colors,
     connection: Option<String>,
+    cells: bool,
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) -> TabView {
-    let grid = ResultGrid::new(hsla(&colors.text.primary), hsla(&colors.text.muted));
+    let grid = ResultGrid::new(colors);
+    let table = cx.new(|cx| {
+        TableState::new(grid, window, cx)
+            .col_movable(false)
+            .cell_selectable(cells)
+    });
+    if cells {
+        cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| {
+            if let TableEvent::DoubleClickedCell(row, col) = event {
+                this.start_edit(*row, *col, window, cx);
+            }
+        })
+        .detach();
+    }
     TabView {
         connection,
         scope: Location::default(),
+        source: None,
+        keys: None,
+        sql: String::new(),
+        saving: false,
         input: cx.new(|cx| EditorState::new(window, cx).language("sql")),
-        table: cx.new(|cx| TableState::new(grid, window, cx).col_movable(false)),
+        table,
         status: String::new(),
         error: None,
         rows: 0,
@@ -135,7 +165,7 @@ impl Shell {
         connections: Result<Vec<SavedConnection>, String>,
     ) -> Self {
         Self {
-            tabs: Tabs::new(new_view(&colors, None, window, cx)),
+            tabs: Tabs::new(new_view(&colors, None, false, window, cx)),
             colors,
             context,
             runtime,
@@ -168,6 +198,7 @@ impl Shell {
         let view = &mut tab.view;
         view.connection = Some(connection.clone());
         view.scope = Location::default();
+        view.source = None;
         view.error = None;
         view.status.clear();
         let id = tab.id;
@@ -194,7 +225,7 @@ impl Shell {
     }
 
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
-        let view = new_view(&self.colors, self.selected.clone(), window, cx);
+        let view = new_view(&self.colors, self.selected.clone(), false, window, cx);
         self.tabs.open(None, None, view);
         cx.notify();
     }
@@ -203,7 +234,7 @@ impl Shell {
         let colors = &self.colors;
         let selected = self.selected.clone();
         self.tabs
-            .close(id, || new_view(colors, selected, window, cx));
+            .close(id, || new_view(colors, selected, false, window, cx));
         self.activate(self.tabs.active_id(), cx);
     }
 
@@ -266,7 +297,11 @@ impl Shell {
         let Some(node) = self.tree.node_mut(&path) else {
             return;
         };
-        let (location, name) = (node.location.clone(), node.entry.name.clone());
+        let (location, name, kind) = (
+            node.location.clone(),
+            node.entry.name.clone(),
+            node.entry.kind,
+        );
         let key = format!(
             "{connection_id}|{:?}|{:?}|{name}",
             location.database, location.schema
@@ -281,7 +316,17 @@ impl Shell {
             let location = location.clone();
             let connection_id = connection_id.clone();
             self.runtime.spawn(async move {
-                explorer::open_table_query(&context, &connection_id, &location, &name).await
+                let sql =
+                    explorer::open_table_query(&context, &connection_id, &location, &name).await?;
+                let columns = if kind == EntryKind::Table {
+                    explorer::editable_columns(&context, &connection_id, &location, &name)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                Ok::<_, String>((sql, columns))
             })
         };
         cx.spawn_in(window, async move |this, cx| {
@@ -291,12 +336,22 @@ impl Shell {
                     return;
                 }
                 match result {
-                    Ok(sql) => {
+                    Ok((sql, columns)) => {
                         if let Some(id) = this.tabs.find(&key) {
                             this.activate(id, cx);
                             return;
                         }
-                        let mut view = new_view(&this.colors, Some(connection_id), window, cx);
+                        let mut view =
+                            new_view(&this.colors, Some(connection_id.clone()), true, window, cx);
+                        view.source = columns.map(|columns| {
+                            Arc::new(Source {
+                                connection_id,
+                                location: location.clone(),
+                                table: title.clone(),
+                                sql: sql.clone(),
+                                columns,
+                            })
+                        });
                         view.scope = location;
                         view.input
                             .update(cx, |input, cx| input.set_value(sql, window, cx));
@@ -378,7 +433,12 @@ impl Shell {
         let Some(tab) = self.tabs.get_mut(id) else {
             return;
         };
-        tab.view.rows = 0;
+        let view = &mut tab.view;
+        view.rows = 0;
+        view.keys = view
+            .source
+            .as_ref()
+            .and_then(|source| source.keys(&view.sql, &columns));
         tab.view.table.update(cx, |table, cx| {
             table.delegate_mut().set(columns, Vec::new());
             table.refresh(cx);
@@ -430,6 +490,15 @@ impl Shell {
         let Some(tab) = self.tabs.get_mut(id) else {
             return;
         };
+        let input = tab.view.input.read(cx);
+        let sql = sql_to_run(&input.selected_value(), &input.value());
+        self.execute(id, sql, window, cx);
+    }
+
+    fn execute(&mut self, id: u64, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return;
+        };
         let Some(connection_id) = tab.view.connection.clone() else {
             tab.view.status = t("sidebar.selectConnection").into();
             cx.notify();
@@ -438,8 +507,7 @@ impl Shell {
         tab.stream.stop();
         let run_id = tab.stream.id();
         let view = &mut tab.view;
-        let input = view.input.read(cx);
-        let sql = sql_to_run(&input.selected_value(), &input.value());
+        view.sql = sql.clone();
         let key = if self.connected.contains(&connection_id) {
             "editor.executingQuery"
         } else {
@@ -522,6 +590,234 @@ impl Shell {
         })
         .detach();
         cx.notify();
+    }
+
+    /// The active tab's view and source, when its result may be edited now.
+    fn editable(&self) -> Option<(&TabView, Arc<Source>)> {
+        let tab = self.tabs.active();
+        let view = &tab.view;
+        // Rows still arriving would shift the indexes of new rows.
+        let idle = !view.saving && !tab.stream.is_running();
+        let source = view
+            .source
+            .clone()
+            .filter(|_| idle && view.keys.is_some())?;
+        Some((view, source))
+    }
+
+    fn update_grid(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut ResultGrid)) {
+        self.tabs.active().view.table.update(cx, |table, cx| {
+            f(table.delegate_mut());
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn start_edit(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((view, _)) = self.editable() else {
+            return;
+        };
+        let grid = view.table.read(cx).delegate();
+        if grid.is_deleted(row) || col >= grid.columns().len() {
+            return;
+        }
+        let text = grid.text(row, col);
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
+        cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.finish_edit(true, window, cx);
+            }
+        })
+        .detach();
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.update_grid(cx, |grid| grid.editor = Some((row, col, input)));
+    }
+
+    fn finish_edit(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let table = self.tabs.active().view.table.clone();
+        table.update(cx, |table, cx| {
+            let grid = table.delegate_mut();
+            if let Some((row, col, input)) = grid.editor.take() {
+                if commit {
+                    let text = input.read(cx).value().to_string();
+                    grid.commit(row, col, Value::String(text));
+                }
+                table.focus_handle(cx).focus(window, cx);
+            }
+            cx.notify();
+        });
+    }
+
+    fn selected_row(&self, cx: &App) -> Option<usize> {
+        match self.tabs.active().view.table.read(cx).selection() {
+            TableSelection::Row(row) | TableSelection::Cell(row, _) => Some(row),
+            _ => None,
+        }
+    }
+
+    fn edit_selected(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
+        if let TableSelection::Cell(row, col) = self.tabs.active().view.table.read(cx).selection() {
+            self.start_edit(row, col, window, cx);
+        }
+    }
+
+    fn set_null(&mut self, cx: &mut Context<Self>) {
+        let Some((view, source)) = self.editable() else {
+            return;
+        };
+        let TableSelection::Cell(row, col) = view.table.read(cx).selection() else {
+            return;
+        };
+        let grid = view.table.read(cx).delegate();
+        let nullable = grid
+            .columns()
+            .get(col)
+            .is_some_and(|name| source.nullable(name));
+        if nullable && !grid.is_deleted(row) {
+            self.update_grid(cx, |grid| grid.commit(row, col, Value::Null));
+        }
+    }
+
+    fn delete_row(&mut self, cx: &mut Context<Self>) {
+        if self.editable().is_none() {
+            return;
+        }
+        if let Some(row) = self.selected_row(cx) {
+            self.update_grid(cx, |grid| grid.toggle_delete(row));
+        }
+    }
+
+    fn new_row(&mut self, cx: &mut Context<Self>) {
+        let Some((_, source)) = self.editable() else {
+            return;
+        };
+        self.update_grid(cx, |grid| {
+            let row = source.new_row(grid.columns());
+            grid.edits.insert(row);
+        });
+        self.tabs.active().view.table.update(cx, |table, cx| {
+            let last = table.delegate().rows_count(cx).saturating_sub(1);
+            table.scroll_to_row(last, cx);
+        });
+    }
+
+    fn discard(&mut self, cx: &mut Context<Self>) {
+        if self.editable().is_some() {
+            self.update_grid(cx, |grid| {
+                grid.edits = Default::default();
+                grid.editor = None;
+            });
+        }
+    }
+
+    fn save(&mut self, _: &SaveEdits, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((view, source)) = self.editable() else {
+            return;
+        };
+        let keys = view.keys.clone().unwrap_or_default();
+        let ops = view.table.read(cx).delegate().ops(&source, &keys);
+        let tab = self.tabs.active_mut();
+        let id = tab.id;
+        let ops = match ops {
+            Ok(ops) if ops.is_empty() => return,
+            Ok(ops) => ops,
+            Err(error) => {
+                tab.view.status = format!("{}{error}", t("dataGrid.updateFailed"));
+                cx.notify();
+                return;
+            }
+        };
+        tab.view.saving = true;
+        let context = self.context.clone();
+        let task = self
+            .runtime
+            .spawn(async move { edits::save(&context, &source, ops).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await.unwrap_or_else(|error| {
+                Err(edits::SaveError {
+                    applied: Vec::new(),
+                    message: error.to_string(),
+                })
+            });
+            this.update_in(cx, |this, window, cx| {
+                let Some(tab) = this.tabs.get_mut(id) else {
+                    return;
+                };
+                tab.view.saving = false;
+                match result {
+                    Ok(()) => {
+                        let sql = tab.view.sql.clone();
+                        this.execute(id, sql, window, cx);
+                    }
+                    Err(error) => {
+                        tab.view.status =
+                            format!("{}{}", t("dataGrid.updateFailed"), error.message);
+                        tab.view.table.update(cx, |table, cx| {
+                            table.delegate_mut().edits.forget(&error.applied);
+                            cx.notify();
+                        });
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn data_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let view = &self.tabs.active().view;
+        view.keys.as_ref()?;
+        let pending = view.table.read(cx).delegate().edits.count();
+        let busy = self.editable().is_none();
+        let button = |id: &'static str, label: &'static str| {
+            Button::new(id).ghost().label(label).disabled(busy)
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .child(
+                    button("new-row", t("editor.newRow"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_row(cx))),
+                )
+                .child(
+                    button("delete-row", t("dataGrid.deleteRow"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.delete_row(cx))),
+                )
+                .child(
+                    button("set-null", t("dataGrid.setNull"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.set_null(cx))),
+                )
+                .child(
+                    button("submit", t("editor.submit"))
+                        .tooltip(t("editor.submitChanges"))
+                        .disabled(busy || pending == 0)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.save(&SaveEdits, window, cx)
+                        })),
+                )
+                .child(
+                    button("rollback", t("editor.rollback"))
+                        .tooltip(t("editor.rollbackChanges"))
+                        .disabled(busy || pending == 0)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.discard(cx))),
+                )
+                .when(pending > 0, |bar| {
+                    bar.child(
+                        div()
+                            .text_sm()
+                            .text_color(hsla(&self.colors.text.accent))
+                            .child(
+                                t("editor.pendingCount").replace("{{count}}", &pending.to_string()),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -662,6 +958,7 @@ impl Render for Shell {
                     .text_color(hsla(&c.text.muted))
                     .child(view.status.clone()),
             );
+        let data_toolbar = self.data_toolbar(cx);
         let grid = div()
             .flex_1()
             .min_h_0()
@@ -678,6 +975,11 @@ impl Render for Shell {
             .text_color(hsla(&c.text.primary))
             .on_action(cx.listener(Self::run_active))
             .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::edit_selected))
+            .on_action(
+                cx.listener(|this, _: &Escape, window, cx| this.finish_edit(false, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 this.close_tab(this.tabs.active_id(), window, cx)
             }))
@@ -691,6 +993,7 @@ impl Render for Shell {
                     .child(bar)
                     .child(Editor::new(&view.input).h(px(160.)))
                     .child(toolbar)
+                    .children(data_toolbar)
                     .child(grid),
             )
     }

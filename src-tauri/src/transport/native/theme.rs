@@ -50,6 +50,9 @@ pub struct Accent {
 pub struct Semantic {
     pub string: String,
     pub number: String,
+    pub modified: String,
+    pub new: String,
+    pub deleted: String,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +101,7 @@ pub fn apply(c: &Colors, t: &mut ThemeColor) {
     t.sidebar = hsla(&c.surface.primary);
     t.sidebar_foreground = hsla(&c.text.primary);
     t.sidebar_border = hsla(&c.border.subtle);
+    t.secondary_foreground = hsla(&c.text.primary);
     t.muted = hsla(&c.surface.secondary);
     t.muted_foreground = hsla(&c.text.muted);
     t.primary = hsla(&c.accent.primary);
