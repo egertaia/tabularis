@@ -1,3 +1,4 @@
+use super::grid::format_cell;
 use super::i18n::t;
 use super::theme::colors_from_source;
 
@@ -15,4 +16,13 @@ fn reads_colors_from_legacy_theme_source() {
     let colors = colors_from_source(&dark.to_string()).unwrap();
     assert_eq!(colors.bg.base, "#020617");
     assert!(colors_from_source("{}").is_none());
+}
+
+#[test]
+fn formats_cells_as_text() {
+    use serde_json::json;
+    assert_eq!(format_cell(&json!(null)), "NULL");
+    assert_eq!(format_cell(&json!("a\"b")), "a\"b");
+    assert_eq!(format_cell(&json!(1.5)), "1.5");
+    assert_eq!(format_cell(&json!({"k": [1, true]})), r#"{"k":[1,true]}"#);
 }

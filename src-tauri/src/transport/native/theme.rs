@@ -90,4 +90,9 @@ pub fn apply(c: &Colors, t: &mut ThemeColor) {
     t.muted_foreground = hsla(&c.text.muted);
     t.primary = hsla(&c.accent.primary);
     t.ring = hsla(&c.border.focus);
+    t.table = hsla(&c.bg.base);
+    t.table_head = hsla(&c.bg.elevated);
+    t.table_head_foreground = hsla(&c.text.muted);
+    t.table_row_border = hsla(&c.border.subtle);
+    t.table_hover = hsla(&c.bg.elevated);
 }
