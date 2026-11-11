@@ -381,18 +381,28 @@ impl Shell {
         cx.notify();
     }
 
-    fn activate(&mut self, id: u64, cx: &mut Context<Self>) {
+    fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.select(id);
         let connection = self.tabs.active_mut().view.connection.clone();
         if connection.is_some() && connection != self.selected {
             self.show_tree(connection.unwrap_or_default(), cx);
         }
+        self.focus_editor(window, cx);
         cx.notify();
+    }
+
+    // Deferred: the editor is only part of the focus tree after the next render.
+    fn focus_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.tabs.active().view.input.clone();
+        window.defer(cx, move |window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx))
+        });
     }
 
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         let view = new_view(&self.colors, self.selected.clone(), false, window, cx);
         self.tabs.open(None, None, view);
+        self.focus_editor(window, cx);
         cx.notify();
     }
 
@@ -401,7 +411,7 @@ impl Shell {
         let selected = self.selected.clone();
         self.tabs
             .close(id, || new_view(colors, selected, false, window, cx));
-        self.activate(self.tabs.active_id(), cx);
+        self.activate(self.tabs.active_id(), window, cx);
     }
 
     fn load(&mut self, path: Vec<usize>, cx: &mut Context<Self>) {
@@ -473,7 +483,7 @@ impl Shell {
             location.database, location.schema
         );
         if let Some(id) = self.tabs.find(&key) {
-            self.activate(id, cx);
+            self.activate(id, window, cx);
             return;
         }
         let (context, tree_id) = (self.context.clone(), self.tree_id);
@@ -504,7 +514,7 @@ impl Shell {
                 match result {
                     Ok((sql, columns)) => {
                         if let Some(id) = this.tabs.find(&key) {
-                            this.activate(id, cx);
+                            this.activate(id, window, cx);
                             return;
                         }
                         let mut view =
@@ -522,6 +532,7 @@ impl Shell {
                         view.input
                             .update(cx, |input, cx| input.set_value(sql, window, cx));
                         let id = this.tabs.open(Some(title), Some(key), view);
+                        this.focus_editor(window, cx);
                         this.run(id, window, cx);
                     }
                     Err(error) => {
@@ -812,8 +823,11 @@ impl Shell {
             }
         })
         .detach();
-        input.update(cx, |input, cx| input.focus(window, cx));
+        let focus = input.clone();
         self.update_grid(cx, |grid| grid.editor = Some((row, col, input)));
+        window.defer(cx, move |window, cx| {
+            focus.update(cx, |input, cx| input.focus(window, cx))
+        });
     }
 
     fn finish_edit(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -839,6 +853,10 @@ impl Shell {
     }
 
     fn edit_selected(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
+        // The input's Enter propagates up and would reopen a fresh editor with the old text.
+        if self.tabs.active().view.table.read(cx).delegate().editor.is_some() {
+            return;
+        }
         if let TableSelection::Cell(row, col) = self.tabs.active().view.table.read(cx).selection() {
             self.start_edit(row, col, window, cx);
         }
@@ -1146,8 +1164,8 @@ impl Render for Shell {
                                 .max_w(px(160.))
                                 .truncate()
                                 .cursor_pointer()
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.activate(id, cx)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.activate(id, window, cx)
                                 }))
                                 .child(tab.title.clone()),
                         )

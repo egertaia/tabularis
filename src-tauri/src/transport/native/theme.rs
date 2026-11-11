@@ -104,6 +104,17 @@ pub fn apply(c: &Colors, t: &mut ThemeColor) {
     t.sidebar_foreground = hsla(&c.text.primary);
     t.sidebar_border = hsla(&c.border.subtle);
     t.secondary_foreground = hsla(&c.text.primary);
+    t.secondary_hover = hsla(&c.bg.elevated);
+    t.secondary_active = hsla(&c.surface.secondary);
+    t.accent = hsla(&c.bg.elevated);
+    t.accent_foreground = hsla(&c.text.primary);
+    t.button = hsla(&c.surface.secondary);
+    t.button_foreground = hsla(&c.text.primary);
+    t.button_hover = hsla(&c.bg.elevated);
+    t.button_active = hsla(&c.surface.secondary);
+    t.button_secondary_foreground = hsla(&c.text.primary);
+    t.button_secondary_hover = hsla(&c.bg.elevated);
+    t.button_secondary_active = hsla(&c.surface.secondary);
     t.muted = hsla(&c.surface.secondary);
     t.muted_foreground = hsla(&c.text.muted);
     t.primary = hsla(&c.accent.primary);
