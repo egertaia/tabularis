@@ -118,6 +118,29 @@ pub async fn columns(
     }
 }
 
+/// `None` unless the connection and driver are writable and the table has a primary key.
+pub async fn editable_columns(
+    runtime: &RuntimeContext,
+    connection_id: &str,
+    location: &Location,
+    table: &str,
+) -> Result<Option<Vec<TableColumn>>, String> {
+    let (_, caps) = capabilities(runtime, connection_id).await?;
+    if caps.readonly || super::read_only::ensure_writable(runtime, connection_id).is_err() {
+        return Ok(None);
+    }
+    let columns = metadata::get_columns(
+        runtime,
+        None,
+        connection_id,
+        table.to_string(),
+        location.schema.clone(),
+        location.database.clone(),
+    )
+    .await?;
+    Ok(columns.iter().any(|column| column.is_pk).then_some(columns))
+}
+
 /// The query the explorer's "open table" action puts in the editor.
 pub async fn open_table_query(
     runtime: &RuntimeContext,

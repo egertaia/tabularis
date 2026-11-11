@@ -533,4 +533,4 @@ fn validate_token(token: &str) -> Result<(), String> {
 
 #[cfg(test)]
 #[path = "records_tests.rs"]
-mod tests;
+pub(crate) mod tests;

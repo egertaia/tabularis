@@ -116,3 +116,68 @@ async fn lists_sqlite_tables_and_views_then_columns_with_types() {
         r#"SELECT * FROM "users""#
     );
 }
+
+#[tokio::test]
+async fn a_result_that_is_not_editable_offers_no_editing() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = RuntimeContext::new(
+        Arc::new(crate::runtime::paths::FixedRuntimePaths::new(
+            temp.path().into(),
+            temp.path().into(),
+        )),
+        Arc::new(crate::runtime::events::NoopRuntimeEvents),
+        Arc::new(NoSecrets),
+    );
+    let database = temp.path().join("editable.sqlite");
+    {
+        use sqlx::{Connection, Executor};
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        connection
+            .execute(
+                "CREATE TABLE keyed (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE keyless (name TEXT);",
+            )
+            .await
+            .unwrap();
+    }
+    crate::drivers::registry::register_driver(SqliteDriver::new()).await;
+    let saved = |id: &str, read_only: bool| -> crate::models::SavedConnection {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "params": {
+                "driver": "sqlite",
+                "database": database.to_string_lossy(),
+                "read_only": read_only,
+            },
+        }))
+        .unwrap()
+    };
+    crate::persistence::save_connections_file(
+        &runtime.paths.connections_file(),
+        &crate::models::ConnectionsFile {
+            connections: vec![saved("writable", false), saved("locked", true)],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let editable = |connection: &'static str, table: &'static str| {
+        let runtime = runtime.clone();
+        async move {
+            editable_columns(&runtime, connection, &Location::default(), table)
+                .await
+                .unwrap()
+                .map(|columns| columns.len())
+        }
+    };
+
+    assert_eq!(editable("writable", "keyed").await, Some(2));
+    assert_eq!(editable("writable", "keyless").await, None);
+    assert_eq!(editable("locked", "keyed").await, None);
+}
