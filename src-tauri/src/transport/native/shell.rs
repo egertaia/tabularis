@@ -57,6 +57,8 @@ pub struct Shell {
     run_id: u64,
     in_flight: Option<tokio::task::AbortHandle>,
     rows: usize,
+    // Result sets seen in the current run; only the first is shown.
+    sets: usize,
     bench: Option<Bench>,
 }
 
@@ -86,6 +88,7 @@ impl Shell {
             run_id: 0,
             in_flight: None,
             rows: 0,
+            sets: 0,
             bench: None,
         }
     }
@@ -128,6 +131,12 @@ impl Shell {
     }
 
     fn show_chunk(&mut self, chunk: QueryChunk, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(chunk, QueryChunk::Columns(_)) {
+            self.sets += 1;
+        }
+        if self.sets > 1 {
+            return;
+        }
         match chunk {
             QueryChunk::Columns(columns) => self.show_columns(columns, cx),
             QueryChunk::Rows(rows) => {
@@ -164,6 +173,7 @@ impl Shell {
         };
         self.status = t(key).into();
         self.error = None;
+        self.sets = 0;
         let (context, cancellation, run_id) =
             (self.context.clone(), self.cancellation.clone(), self.run_id);
         let id = connection_id.clone();
